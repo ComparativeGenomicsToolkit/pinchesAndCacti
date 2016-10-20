@@ -368,16 +368,15 @@ static void testStFeatureBlock_getContextualFeatureBlocksForChainedBlocks(CuTest
         blocks, 100, 2, true, false, strings);
     CuAssertIntEquals(testCase, 9, stList_length(featureBlocks));
 
-    printf("----\n");
-
     stList *contextualBlocks = stFeatureBlock_getContextualBlocksForChainedBlocks(
         blocks, 100, 2, true, false, strings);
     CuAssertIntEquals(testCase, 9, stList_length(contextualBlocks));
 
+    stList_destruct(featureBlocks);
+    stList_destruct(contextualBlocks);
+
     // Now check it only gets the chain and 1 very close block if the base
     // distance is small enough.
-
-    printf("====\n");
 
     featureBlocks = stFeatureBlock_getContextualFeatureBlocksForChainedBlocks(
         blocks, 9, 2, false, false, strings);
@@ -894,11 +893,11 @@ static void testRandomSplitTreeOnOutgroups(CuTest *testCase) {
 // Replaces all DNA in the given columns with the given character
 // (destructively).
 static stList *replaceBlockStringsWithChar(stList *featureBlocks, char repl, stPinchBlock *pinchBlock) {
-    stList *ret = stList_construct();
+    stList *ret = stList_construct3(0, (void (*)(void *)) stFeatureBlock_destruct);
     for(int64_t i = 0; i < stList_length(featureBlocks); i++) {
         stFeatureBlock *featureBlock = stList_get(featureBlocks, i);
         stFeatureBlock *retFeatureBlock = malloc(sizeof(stFeatureBlock));
-        retFeatureBlock->segments = stList_construct3(stPinchBlock_getDegree(pinchBlock), (void (*)(void *)) stFeatureBlock_destruct);
+        retFeatureBlock->segments = stList_construct2(stPinchBlock_getDegree(pinchBlock));
         retFeatureBlock->length = featureBlock->length;
         stFeatureSegment *segment = featureBlock->head;
         stFeatureSegment *curSegment = malloc(sizeof(stFeatureSegment));
@@ -964,6 +963,27 @@ static void likelihoodTestFn(stPinchBlock *block, stList *featureBlocks, CuTest 
         CuAssertTrue(testCase, likelihood <= maxLikelihood);
     }
 
+    // Clean up.
+    for (int64_t i = 0; i < stList_length(maxBlocks); i++) {
+        stFeatureBlock *block = stList_get(maxBlocks, i);
+        stFeatureSegment *segment = block->head;
+        while (segment != NULL) {
+            free((void *) segment->string);
+            segment = segment->nFeatureSegment;
+        }
+    }
+    stList_destruct(maxBlocks);
+    stList_destruct(maxColumns);
+    for (int64_t i = 0; i < stList_length(ambiguousBlocks); i++) {
+        stFeatureBlock *block = stList_get(ambiguousBlocks, i);
+        stFeatureSegment *segment = block->head;
+        while (segment != NULL) {
+            free((void *) segment->string);
+            segment = segment->nFeatureSegment;
+        }
+    }
+    stList_destruct(ambiguousBlocks);
+    stList_destruct(ambiguousColumns);
     stPhylogenyInfo_destructOnTree(tree);
     stTree_destruct(tree);
     stList_destruct(featureColumns);
@@ -1005,6 +1025,7 @@ static void reconciliationLikelihoodTestFn(stPinchBlock *block, stList *featureB
     stPhylogenyInfo_destructOnTree(speciesTree);
     stTree_destruct(speciesTree);
     stList_destruct(featureColumns);
+    stHash_destruct(leafToSpecies);
 }
 
 static void testStPinchPhylogeny_reconciliationLikelihood(CuTest *testCase) {
