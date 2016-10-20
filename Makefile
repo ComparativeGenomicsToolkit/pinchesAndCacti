@@ -11,7 +11,7 @@ all : externalToolsM ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCacti
 externalToolsM : 
 	cd externalTools && make all
 
-${libPath}/stPinchesAndCacti.a : ${libSources} ${libCppSources} ${libHeaders} ${basicLibsDependencies} ${spimapReconLib}
+${libPath}/stPinchesAndCacti.a : ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
 	${cxx} ${cflags} -I inc -I ${libPath}/ -c ${libSources}
 	ar rc stPinchesAndCacti.a *.o
 	ranlib stPinchesAndCacti.a 
@@ -19,8 +19,8 @@ ${libPath}/stPinchesAndCacti.a : ${libSources} ${libCppSources} ${libHeaders} ${
 	mv stPinchesAndCacti.a ${libPath}/
 	cp ${libHeaders} ${libPath}/
 
-${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${basicLibsDependencies} ${libPath}/3EdgeConnected.a ${libPath}/stPinchesAndCacti.a
-	${cxx} ${cflags} -I inc -I impl -I${libPath} -o ${binPath}/stPinchesAndCactiTests ${libTests} ${libSources} ${basicLibs}  ${libPath}/3EdgeConnected.a ${libPath}/stPinchesAndCacti.a -lstdc++
+${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM ${libPath}/3EdgeConnected.a
+	${cxx} ${cflags} -I inc -I impl -I${libPath} -o ${binPath}/stPinchesAndCactiTests ${libTests} ${libSources} ${basicLibs}  ${libPath}/3EdgeConnected.a
 
 clean : 
 	cd externalTools && make clean
@@ -28,4 +28,4 @@ clean :
 	rm -f ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCactiTests
 
 test : all
-	python allTests.py
+	${binPath}/stPinchesAndCactiTests
