@@ -19,7 +19,7 @@ ${libPath}/stPinchesAndCacti.a : ${libSources} ${libHeaders} ${basicLibsDependen
 	mv stPinchesAndCacti.a ${libPath}/
 	cp ${libHeaders} ${libPath}/
 
-${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
+${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM ${libPath}/3EdgeConnected.a
 	${cxx} ${cflags} -I inc -I impl -I${libPath} -o ${binPath}/stPinchesAndCactiTests ${libTests} ${libSources} ${basicLibs}  ${libPath}/3EdgeConnected.a
 
 clean : 

@@ -1,3 +1,5 @@
+rootPath = ..
+include ../include.mk
 # order is important, libraries first
 modules = threeEdgeConnected
 #pulldown
