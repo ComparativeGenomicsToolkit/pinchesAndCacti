@@ -9,7 +9,7 @@ testBin = tests/testBin
 all : externalToolsM ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCactiTests
 
 externalToolsM : 
-	cd externalTools && make all
+	cd externalTools && ${MAKE} all
 
 ${libPath}/stPinchesAndCacti.a : ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
 	${cxx} ${cflags} -I inc -I ${libPath}/ -c ${libSources}
@@ -23,7 +23,7 @@ ${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${ba
 	${cxx} ${cflags} -I inc -I impl -I${libPath} -o ${binPath}/stPinchesAndCactiTests ${libTests} ${libSources} ${basicLibs}  ${libPath}/3EdgeConnected.a
 
 clean : 
-	cd externalTools && make clean
+	cd externalTools && ${MAKE} clean
 	rm -f *.o
 	rm -f ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCactiTests
 
