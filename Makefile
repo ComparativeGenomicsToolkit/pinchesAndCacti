@@ -6,12 +6,15 @@ libHeaders = inc/*.h
 libTests = tests/*.c
 testBin = tests/testBin
 
-all : externalToolsM ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCactiTests
+all: all_libs all_progs
+all_libs: externalToolsM ${libPath}/stPinchesAndCacti.a
+all_progs: all_libs
+	${MAKE} ${binPath}/stPinchesAndCactiTests
 
 externalToolsM : 
 	cd externalTools && ${MAKE} all
 
-${libPath}/stPinchesAndCacti.a : ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
+${libPath}/stPinchesAndCacti.a:  ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
 	${cxx} ${cflags} -I inc -I ${libPath}/ -c ${libSources}
 	ar rc stPinchesAndCacti.a *.o
 	ranlib stPinchesAndCacti.a 
