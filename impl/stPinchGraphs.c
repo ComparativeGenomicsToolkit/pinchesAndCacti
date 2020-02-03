@@ -1461,7 +1461,7 @@ static bool stPinchInterval_containsSegment(stPinchInterval *interval, stPinchSe
         && stPinchInterval_getStart(interval) + stPinchInterval_getLength(interval) >= stPinchSegment_getStart(segment) + stPinchSegment_getLength(segment);
 }
 
-#if 0
+#ifndef NDEBUG
 static bool stPinchBlock_check(stPinchBlock *block) {
     stPinchSegment *segment = block->headSegment;
     int64_t i = 0;
