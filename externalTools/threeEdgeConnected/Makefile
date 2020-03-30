@@ -5,18 +5,17 @@ libSources = impl/*.c
 libHeaders = inc/*.h
 libTests = tests/*.c
 
-all : ${libPath}/3EdgeConnected.a ${binPath}/3EdgeTests
+all : ${LIBDIR}/3EdgeConnected.a ${BINDIR}/3EdgeTests
 
-${libPath}/3EdgeConnected.a : ${libSources} ${libHeaders} ${basicLibsDependencies}
-	${cxx} ${cflags} -I ${libPath}/ -c ${libSources}
-	ar rc 3EdgeConnected.a *.o
-	ranlib 3EdgeConnected.a 
-	rm *.o
-	mv 3EdgeConnected.a ${libPath}/
-	cp ${libHeaders} ${libPath}/
+${LIBDIR}/3EdgeConnected.a : ${libSources} ${libHeaders} ${LIBDEPENDS}
+	${CC} ${CPPFLAGS} ${CFLAGS} -c ${libSources}
+	${AR} rc 3EdgeConnected.a *.o
+	${RANLIB} 3EdgeConnected.a 
+	mv 3EdgeConnected.a ${LIBDIR}/
+	cp ${libHeaders} ${LIBDIR}/
 
 clean : 
-	rm -f ${libPath}/3EdgeConnected.a ${binPath}/3EdgeTests
+	rm -f ${LIBDIR}/3EdgeConnected.a ${BINDIR}/3EdgeTests *.o
 
-${binPath}/3EdgeTests : ${libTests} ${libSources} ${libHeaders} ${libPath}/3EdgeConnected.a ${basicLibsDependencies}
-	${cxx} ${cflags} -I inc -I${libPath} -o ${binPath}/3EdgeTests ${libTests} ${libPath}/3EdgeConnected.a ${basicLibs}
+${BINDIR}/3EdgeTests : ${libTests} ${libSources} ${libHeaders} ${LIBDIR}/3EdgeConnected.a ${LIBDEPENDS}
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${BINDIR}/3EdgeTests ${libTests} ${LIBDIR}/3EdgeConnected.a ${LDLIBS}

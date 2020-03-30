@@ -7,28 +7,27 @@ libTests = tests/*.c
 testBin = tests/testBin
 
 all: all_libs all_progs
-all_libs: externalToolsM ${libPath}/stPinchesAndCacti.a
+all_libs: externalToolsM ${LIBDIR}/stPinchesAndCacti.a
 all_progs: all_libs
-	${MAKE} ${binPath}/stPinchesAndCactiTests
+	${MAKE} ${BINDIR}/stPinchesAndCactiTests
 
 externalToolsM : 
 	cd externalTools && ${MAKE} all
 
-${libPath}/stPinchesAndCacti.a:  ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM
-	${cxx} ${cflags} -I inc -I ${libPath}/ -c ${libSources}
-	ar rc stPinchesAndCacti.a *.o
-	ranlib stPinchesAndCacti.a 
-	rm *.o
-	mv stPinchesAndCacti.a ${libPath}/
-	cp ${libHeaders} ${libPath}/
+${LIBDIR}/stPinchesAndCacti.a:  ${libSources} ${libHeaders} ${LIBDEPENDS} externalToolsM
+	${CC} ${CPPFLAGS} ${CFLAGS} -c ${libSources}
+	${AR} rc stPinchesAndCacti.a *.o
+	${RANLIB} stPinchesAndCacti.a 
+	mv stPinchesAndCacti.a ${LIBDIR}/
+	cp ${libHeaders} ${LIBDIR}/
 
-${binPath}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${basicLibsDependencies} externalToolsM ${libPath}/3EdgeConnected.a
-	${cxx} ${cflags} -I inc -I impl -I${libPath} -o ${binPath}/stPinchesAndCactiTests ${libTests} ${libSources} ${basicLibs}  ${libPath}/3EdgeConnected.a
+${BINDIR}/stPinchesAndCactiTests : ${libTests} ${libSources} ${libHeaders} ${LIBDEPENDS} externalToolsM ${LIBDIR}/3EdgeConnected.a
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${BINDIR}/stPinchesAndCactiTests ${libTests} ${libSources} ${LIBDIR}/3EdgeConnected.a ${LDLIBS}
 
 clean : 
 	cd externalTools && ${MAKE} clean
 	rm -f *.o
-	rm -f ${libPath}/stPinchesAndCacti.a ${binPath}/stPinchesAndCactiTests
+	rm -f ${LIBDIR}/stPinchesAndCacti.a ${BINDIR}/stPinchesAndCactiTests
 
 test : all
-	${binPath}/stPinchesAndCactiTests
+	${BINDIR}/stPinchesAndCactiTests
