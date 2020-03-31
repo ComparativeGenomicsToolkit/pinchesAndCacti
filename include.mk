@@ -2,8 +2,8 @@
 sonLibRootDir ?= ${rootPath}/../sonLib
 sonLibDir=${sonLibRootDir}/lib
 #Use sonLib bin and lib dirs
-BINDIR=${sonLibRootDir}/bin
-LIBDIR=${sonLibDir}
+BINDIR ?= ${sonLibRootDir}/bin
+LIBDIR ?= ${sonLibDir}
 
 include  ${sonLibRootDir}/include.mk
 
