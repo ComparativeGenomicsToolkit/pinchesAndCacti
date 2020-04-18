@@ -8,5 +8,5 @@ LIBDIR ?= ${sonLibDir}
 include  ${sonLibRootDir}/include.mk
 
 CPPFLAGS += -I${sonLibRootDir}/lib
-LDLIBS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a ${dblibs}
+LDLIBS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a ${dblibs} ${LIBS}
 LIBDEPENDS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a 
