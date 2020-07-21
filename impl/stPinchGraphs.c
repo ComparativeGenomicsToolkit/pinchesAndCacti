@@ -35,7 +35,8 @@ struct _stPinchSegment {
 
 struct _stPinchBlock {
     uint64_t degree;
-    uint64_t numSupportingHomologies;
+    uint64_t numSupportingHomologies : 63;
+    uint64_t filterFlag : 1;
     stPinchSegment *headSegment;
     stPinchSegment *tailSegment;
 };
@@ -55,6 +56,7 @@ stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation)
     connectBlockToSegment(segment, orientation, block, NULL);
     block->degree = 1;
     block->numSupportingHomologies = 0;
+    block->filterFlag = 0;
     return block;
 }
 
@@ -71,6 +73,7 @@ stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1
     connectBlockToSegment(segment2, orientation2, block, NULL);
     block->degree = 2;
     block->numSupportingHomologies = 1;
+    block->filterFlag = 0;
     return block;
 }
 
@@ -157,6 +160,14 @@ int64_t stPinchBlock_getLength(stPinchBlock *block) {
 
 uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block) {
     return block->numSupportingHomologies;
+}
+
+bool stPinchBlock_getFilterFlag(stPinchBlock* block) {
+    return (bool)block->filterFlag;
+}
+
+void stPinchBlock_setFilterFlag(stPinchBlock* block, bool flag) {
+    block->filterFlag = (uint64_t)flag;
 }
 
 void stPinchBlock_trim(stPinchBlock *block, int64_t blockEndTrim) {

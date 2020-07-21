@@ -405,6 +405,18 @@ uint64_t stPinchBlock_getDegree(stPinchBlock *block);
 uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block);
 
 /*
+ * Get the filter flag of the block.  This is set externally
+ * (ie in the caf secondary alignment pincher) and not updated
+ * within the pinch graph library, save being initialized to 0)
+ */
+bool stPinchBlock_getFilterFlag(stPinchBlock* block);
+
+/*
+ * Set the filter flag
+ */
+void stPinchBlock_setFilterFlag(stPinchBlock* block, bool flag);
+
+/*
  * Trim the given number of bases away from each end of the block. The
  * parts trimmed away become unaligned.
  */
