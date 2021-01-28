@@ -499,7 +499,7 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
     int64_t i;
     double tsum;
     clock_t first, end;
-    st_logInfo(
+    st_logDebug(
             "\nComputing 3edge connected components using\nDr. Tsin's algorithm(The one with reduction)...\n");
     first = clock(); //save CPU clock to variable first
 
@@ -551,7 +551,7 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
     }
     edgeNum = edgeNum / 2;
 
-    st_logInfo("\nComplexity of the given graph:\n|V| + |E| = %d + %d = %d\n",
+    st_logDebug("\nComplexity of the given graph:\n|V| + |E| = %d + %d = %d\n",
             Vnum - 1, edgeNum, Vnum + edgeNum - 1);
 
     count = 1;
@@ -597,8 +597,8 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
 
     end = clock(); //save again CPU clock to variable end
     tsum = (end - first) / CLOCKS_PER_SEC; //compute total elapsed time
-    st_logInfo("\nElapsed Time: %f", tsum);
-    st_logInfo("\nConnected Components: %d\n", compNum);
+    st_logDebug("\nElapsed Time: %f", tsum);
+    st_logDebug("\nConnected Components: %d\n", compNum);
 
     //////////////
     //Cleanup
