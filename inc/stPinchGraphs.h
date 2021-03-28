@@ -269,7 +269,7 @@ void stPinchThread_pinch(stPinchThread *thread1, stPinchThread *thread2, int64_t
  * be applied.
  */
 void stPinchThread_filterPinch(stPinchThread *thread1, stPinchThread *thread2, int64_t start1, int64_t start2,
-        int64_t length, bool strand2, bool(*filterFn)(stPinchSegment *, stPinchSegment *));
+        int64_t length, bool strand2, bool(*filterFn)(stPinchSegment *, stPinchSegment *, void *), void *extraArg);
 
 //Segments
 

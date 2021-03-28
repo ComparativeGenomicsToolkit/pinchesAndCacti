@@ -1278,14 +1278,14 @@ static void stPinchThread_filterPinchPositiveStrandP(stPinchSegment **segment1, 
 }
 
 static void stPinchThread_filterPinchPositiveStrand(stPinchThread *thread1, stPinchThread *thread2, int64_t start1, int64_t start2,
-        int64_t length, bool(*filterFn)(stPinchSegment *, stPinchSegment *)) {
+        int64_t length, bool(*filterFn)(stPinchSegment *, stPinchSegment *, void *), void *extraArg) {
     stPinchSegment *segment1 = stPinchThread_getSegment(thread1, start1);
     stPinchSegment *segment2 = stPinchThread_getSegment(thread2, start2);
     int64_t offset = 0;
     while (offset < length) {
         assert(segment1 != NULL);
         assert(segment2 != NULL);
-        if (filterFn(segment1, segment2)) {
+        if (filterFn(segment1, segment2, extraArg)) {
             stPinchThread_filterPinchPositiveStrandP(&segment1, &segment2, start1, start2, &offset);
         } else {
             int64_t start = offset;
@@ -1305,7 +1305,8 @@ static void stPinchThread_filterPinchPositiveStrand(stPinchThread *thread1, stPi
     }
 }
 
-static void stPinchThread_filterPinchNegativeStrandP(stPinchSegment **segment1, stPinchSegment **segment2, int64_t start1, int64_t end2, int64_t *offset) {
+static void stPinchThread_filterPinchNegativeStrandP(stPinchSegment **segment1, stPinchSegment **segment2,
+                                                     int64_t start1, int64_t end2, int64_t *offset) {
     int64_t i = stPinchSegment_getStart(*segment1) + stPinchSegment_getLength(*segment1) - start1;
     int64_t j = end2 - stPinchSegment_getStart(*segment2);
     if(i == j) {
@@ -1323,14 +1324,14 @@ static void stPinchThread_filterPinchNegativeStrandP(stPinchSegment **segment1, 
 }
 
 static void stPinchThread_filterPinchNegativeStrand(stPinchThread *thread1, stPinchThread *thread2, int64_t start1, int64_t start2,
-        int64_t length, bool(*filterFn)(stPinchSegment *, stPinchSegment *)) {
+        int64_t length, bool(*filterFn)(stPinchSegment *, stPinchSegment *, void *), void *extraArg) {
     stPinchSegment *segment1 = stPinchThread_getSegment(thread1, start1);
     stPinchSegment *segment2 = stPinchThread_getSegment(thread2, start2 + length - 1);
     int64_t offset = 0;
     while  (offset < length) {
         assert(segment1 != NULL);
         assert(segment2 != NULL);
-        if (filterFn(segment1, segment2)) {
+        if (filterFn(segment1, segment2, extraArg)) {
             stPinchThread_filterPinchNegativeStrandP(&segment1, &segment2, start1, start2 + length, &offset);
         } else {
             int64_t start = offset;
@@ -1351,12 +1352,12 @@ static void stPinchThread_filterPinchNegativeStrand(stPinchThread *thread1, stPi
 }
 
 void stPinchThread_filterPinch(stPinchThread *thread1, stPinchThread *thread2, int64_t start1, int64_t start2,
-        int64_t length, bool strand2, bool(*filterFn)(stPinchSegment *, stPinchSegment *)) {
+        int64_t length, bool strand2, bool(*filterFn)(stPinchSegment *, stPinchSegment *, void *), void *extraArg) {
     if(strand2) {
-        stPinchThread_filterPinchPositiveStrand(thread1, thread2, start1, start2, length, filterFn);
+        stPinchThread_filterPinchPositiveStrand(thread1, thread2, start1, start2, length, filterFn, extraArg);
     }
     else {
-        stPinchThread_filterPinchNegativeStrand(thread1, thread2, start1, start2, length, filterFn);
+        stPinchThread_filterPinchNegativeStrand(thread1, thread2, start1, start2, length, filterFn, extraArg);
     }
 }
 

@@ -665,7 +665,7 @@ static stSortedSet *getNames(stPinchSegment *segment) {
     return names;
 }
 
-static bool testStPinchThread_filterPinch_randomTests_filterFn(stPinchSegment *segment1, stPinchSegment *segment2) {
+static bool testStPinchThread_filterPinch_randomTests_filterFn(stPinchSegment *segment1, stPinchSegment *segment2, void *extraArg) {
     return checkIntersection(getNames(segment1), getNames(segment2));
 }
 
@@ -697,7 +697,7 @@ static void testStPinchThread_filterPinch_randomTests(CuTest *testCase) {
             stPinch pinch = stPinchThreadSet_getRandomPinch(threadSet);
             stPinchThread_filterPinch(stPinchThreadSet_getThread(threadSet, pinch.name1),
                     stPinchThreadSet_getThread(threadSet, pinch.name2), pinch.start1, pinch.start2, pinch.length,
-                    pinch.strand, testStPinchThread_filterPinch_randomTests_filterFn);
+                    pinch.strand, testStPinchThread_filterPinch_randomTests_filterFn, NULL);
             //now do all the pushing together of the equivalence classes
             for (int64_t i = 0; i < pinch.length; i++) {
                 stSortedSet *column1 = getColumn(columns, pinch.name1, pinch.start1 + i, 1);
