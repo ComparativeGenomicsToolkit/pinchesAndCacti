@@ -364,7 +364,7 @@ int64_t stPinchThread_getLength(stPinchThread *thread) {
 }
 
 stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordinate) {
-    static stPinchSegment segment;
+    stPinchSegment segment;
     segment.start = coordinate;
     stPinchSegment *segment2 = stSortedSet_searchLessThanOrEqual(thread->segments, &segment);
     if (segment2 == NULL) {
@@ -615,7 +615,7 @@ stPinchThread *stPinchThreadSet_addThread(stPinchThreadSet *threadSet, int64_t n
 }
 
 stPinchThread *stPinchThreadSet_getThread(stPinchThreadSet *threadSet, int64_t name) {
-    static stPinchThread thread;
+    stPinchThread thread;
     thread.name = name;
     return stHash_search(threadSet->threadsHash, &thread);
 }
