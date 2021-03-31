@@ -605,7 +605,7 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
 
     stSortedSet_destruct(ev->adjacencyEdgesSet); //This gets rid of all remaining ev->edges
     ev->adjacencyEdgesSet = NULL;
-
+    stList *returnList = ev->list; // The list to return, saving a pointer to it before cleaning up ev
     free(ev->LG);
     free(ev->LB);
     free(ev->LBend);
@@ -618,5 +618,5 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
     free(ev->outgoing_tree_edge);
     free(ev);
 
-    return ev->list;
+    return returnList;
 }
