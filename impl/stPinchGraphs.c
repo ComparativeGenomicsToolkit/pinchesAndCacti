@@ -37,7 +37,7 @@ struct _stPinchSegment {
 struct _stPinchBlock {
     uint64_t degree;
     uint64_t numSupportingHomologies : 63;
-    uint64_t filterFlag : 1;
+    uint64_t flags; // From least significant bit to highest: modified flag, filter flag
     stPinchSegment *headSegment;
     stPinchSegment *tailSegment;
 };
@@ -45,19 +45,20 @@ struct _stPinchBlock {
 //Blocks
 
 static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stPinchBlock *block, stPinchSegment *nBlockSegment) {
+    if(block != NULL) {
+        stPinchBlock_setModifiedFlag(block, true);
+    }
     segment->block = block;
     segment->blockOrientation = orientation;
     segment->nBlockSegment = nBlockSegment;
 }
 
 stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation) {
-    stPinchBlock *block = st_malloc(sizeof(stPinchBlock));
+    stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock)); // note, calloc will set flags and numSupportingHomologies to be 0
     block->headSegment = segment;
     block->tailSegment = segment;
     connectBlockToSegment(segment, orientation, block, NULL);
     block->degree = 1;
-    block->numSupportingHomologies = 0;
-    block->filterFlag = 0;
     return block;
 }
 
@@ -67,14 +68,13 @@ stPinchBlock *stPinchBlock_construct2(stPinchSegment *segment) {
 
 stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1, stPinchSegment *segment2, bool orientation2) {
     assert(stPinchSegment_getLength(segment1) == stPinchSegment_getLength(segment2));
-    stPinchBlock *block = st_malloc(sizeof(stPinchBlock));
+    stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock));
     block->headSegment = segment1;
     block->tailSegment = segment2;
     connectBlockToSegment(segment1, orientation1, block, segment2);
     connectBlockToSegment(segment2, orientation2, block, NULL);
     block->degree = 2;
     block->numSupportingHomologies = 1;
-    block->filterFlag = 0;
     return block;
 }
 
@@ -163,12 +163,37 @@ uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block) {
     return block->numSupportingHomologies;
 }
 
+/*
+ * Sets a bit of a chosen flag
+ */
+static void setFlag(stPinchBlock* block, int64_t bit, bool flag) {
+    block->flags &= ~(1UL << bit); // first clear the existing value
+    if(flag) { // now set the new value
+        block->flags |= 1UL << bit;
+    }
+}
+
+/*
+ * Gets a chosen flag
+ */
+static bool getFlag(stPinchBlock* block, int64_t bit) {
+    return (block->flags >> bit) & 1;
+}
+
+bool stPinchBlock_getModifiedFlag(stPinchBlock* block) {
+    return getFlag(block, 0);
+}
+
+void stPinchBlock_setModifiedFlag(stPinchBlock* block, bool flag) {
+    setFlag(block, 0, flag);
+}
+
 bool stPinchBlock_getFilterFlag(stPinchBlock* block) {
-    return (bool)block->filterFlag;
+    return getFlag(block, 1);
 }
 
 void stPinchBlock_setFilterFlag(stPinchBlock* block, bool flag) {
-    block->filterFlag = (uint64_t)flag;
+    setFlag(block, 1, flag);
 }
 
 void stPinchBlock_trim(stPinchBlock *block, int64_t blockEndTrim) {
@@ -1531,7 +1556,9 @@ static stPinchBlock *splitBlockUsingUndoBlock(stPinchBlock *block, stPinchSegmen
             }
 
             int64_t endi = i + undoBlock->degree;
-            stPinchBlock *newBlock = st_malloc(sizeof(stPinchBlock));
+            stPinchBlock *newBlock = st_calloc(1, sizeof(stPinchBlock));
+            stPinchBlock_setModifiedFlag(newBlock, 1); // Mark the newly created block as modified
+            stPinchBlock_setModifiedFlag(block, 1); // Mark the old block as modified
             newBlock->headSegment = segment;
             while (i < endi) {
                 segment->block = newBlock;
@@ -1565,6 +1592,7 @@ static stPinchBlock *splitBlockUsingUndoBlock(stPinchBlock *block, stPinchSegmen
             assert(stPinchBlock_check(block));
             newBlock->numSupportingHomologies = undoBlock->numSupportingHomologies;
             block->numSupportingHomologies -= newBlock->numSupportingHomologies + 1;
+
             return newBlock;
         }
         i++;

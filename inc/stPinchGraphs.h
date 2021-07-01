@@ -405,6 +405,17 @@ uint64_t stPinchBlock_getDegree(stPinchBlock *block);
 uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block);
 
 /*
+ * Flag to indicate if a block has been modified. Will be set true when a block
+ * has segments added or removed.
+ */
+bool stPinchBlock_getModifiedFlag(stPinchBlock* block);
+
+/*
+ * Allows the modified flag to be set false (or true).
+ */
+void stPinchBlock_setModifiedFlag(stPinchBlock* block, bool flag);
+
+/*
  * Get the filter flag of the block.  This is set externally
  * (ie in the caf secondary alignment pincher) and not updated
  * within the pinch graph library, save being initialized to 0)
