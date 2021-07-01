@@ -36,8 +36,8 @@ struct _stPinchSegment {
 
 struct _stPinchBlock {
     uint64_t degree;
-    uint64_t numSupportingHomologies : 63;
-    uint64_t flags; // From least significant bit to highest: modified flag, filter flag
+    uint64_t numSupportingHomologies : 62;
+    uint64_t flags : 2; // From least significant bit to highest: modified flag, filter flag
     stPinchSegment *headSegment;
     stPinchSegment *tailSegment;
 };
@@ -45,7 +45,7 @@ struct _stPinchBlock {
 //Blocks
 
 static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stPinchBlock *block, stPinchSegment *nBlockSegment) {
-    if(block != NULL) {
+    if(block != NULL) { // This makes sure  the modified flag is set when the block is altered
         stPinchBlock_setModifiedFlag(block, true);
     }
     segment->block = block;
@@ -57,7 +57,7 @@ stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation)
     stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock)); // note, calloc will set flags and numSupportingHomologies to be 0
     block->headSegment = segment;
     block->tailSegment = segment;
-    connectBlockToSegment(segment, orientation, block, NULL);
+    connectBlockToSegment(segment, orientation, block, NULL); // this will set the modified flag
     block->degree = 1;
     return block;
 }
@@ -68,10 +68,10 @@ stPinchBlock *stPinchBlock_construct2(stPinchSegment *segment) {
 
 stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1, stPinchSegment *segment2, bool orientation2) {
     assert(stPinchSegment_getLength(segment1) == stPinchSegment_getLength(segment2));
-    stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock));
+    stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock)); // note, calloc will set flags and numSupportingHomologies to be 0
     block->headSegment = segment1;
     block->tailSegment = segment2;
-    connectBlockToSegment(segment1, orientation1, block, segment2);
+    connectBlockToSegment(segment1, orientation1, block, segment2);  // this will set the modified flag
     connectBlockToSegment(segment2, orientation2, block, NULL);
     block->degree = 2;
     block->numSupportingHomologies = 1;
@@ -97,7 +97,7 @@ stPinchBlock *stPinchBlock_pinch2_noSupport(stPinchBlock *block, stPinchSegment 
 }
 
 stPinchBlock *stPinchBlock_pinch(stPinchBlock *block1, stPinchBlock *block2, bool orientation) {
-    if (block1 == block2) {
+    if (block1 == block2) { // in this case we don't modify the block
         block1->numSupportingHomologies++;
         return block1; //Already joined
     }
@@ -125,7 +125,7 @@ stPinchBlock *stPinchBlock_pinch2(stPinchBlock *block, stPinchSegment *segment, 
     assert(block->tailSegment != NULL);
     assert(block->tailSegment->nBlockSegment == NULL);
     block->tailSegment->nBlockSegment = segment;
-    connectBlockToSegment(segment, orientation, block, NULL);
+    connectBlockToSegment(segment, orientation, block, NULL); // sets the modified flag
     block->tailSegment = segment;
     block->degree++;
     block->numSupportingHomologies++;
