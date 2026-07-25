@@ -23,8 +23,8 @@ struct _stPinchThreadSet {
  * Random access by coordinate used to go through a per-thread AVL tree holding every
  * segment, which cost ~48 bytes of heap per segment (a 32 byte avl_node plus malloc
  * overhead) and dominated memory in segment-rich graphs.  It is replaced here by a
- * coarse index: one segment pointer per 512 bases of thread (coarser still on very long
- * threads), which costs 8 bytes per bucket regardless of how many segments there are.
+ * coarse index: one segment pointer per ST_PINCH_INDEX_BUCKET bases of thread, which
+ * costs a fixed 8 bytes per bucket regardless of how many segments there are.
  *
  * Index invariant: if index[k] is not NULL then index[k]->start <= the first
  * coordinate of bucket k.  So a lookup can always start at index[k] (or at the
@@ -47,15 +47,32 @@ struct _stPinchThread {
     bool indexStale; //set when a merge frees a segment the index may still point at
 };
 
+/*
+ * The block pointer and the block orientation share a word: blocks come from malloc so
+ * they are at least 16 byte aligned, leaving the low bit free for the orientation.  This
+ * keeps the segment at 48 bytes rather than 56, which matters because there is one segment
+ * per alignment breakpoint per thread and they dominate memory in a large pinch graph.
+ */
 struct _stPinchSegment {
     stPinchThread *thread;
     int64_t start;
     stPinchSegment *pSegment;
     stPinchSegment *nSegment;
-    stPinchBlock *block;
-    bool blockOrientation;
+    uintptr_t blockAndOrientation;
     stPinchSegment *nBlockSegment;
 };
+
+//48 bytes is the next size class down from 64 in jemalloc, so letting the segment grow
+//past it costs 16 bytes each.  fail the build rather than quietly hand that back
+typedef char stPinchSegment_isSmall[(sizeof(struct _stPinchSegment) <= 48) ? 1 : -1];
+
+#define stPinchSegment_block(segment) ((stPinchBlock *)((segment)->blockAndOrientation & ~(uintptr_t)1))
+#define stPinchSegment_orientation(segment) ((bool)((segment)->blockAndOrientation & (uintptr_t)1))
+
+static inline void stPinchSegment_setBlockAndOrientation(stPinchSegment *segment, stPinchBlock *block, bool orientation) {
+    assert(((uintptr_t)block & (uintptr_t)1) == 0);
+    segment->blockAndOrientation = (uintptr_t)block | (orientation ? (uintptr_t)1 : (uintptr_t)0);
+}
 
 struct _stPinchBlock {
     uint64_t degree;
@@ -71,8 +88,7 @@ static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stP
     if(block != NULL) { // This makes sure  the modified flag is set when the block is altered
         stPinchBlock_setModifiedFlag(block, true);
     }
-    segment->block = block;
-    segment->blockOrientation = orientation;
+    stPinchSegment_setBlockAndOrientation(segment, block, orientation);
     segment->nBlockSegment = nBlockSegment;
 }
 
@@ -255,15 +271,15 @@ int64_t stPinchSegment_getLength(stPinchSegment *segment) {
 }
 
 stPinchBlock *stPinchSegment_getBlock(stPinchSegment *segment) {
-    return segment->block;
+    return stPinchSegment_block(segment);
 }
 
 bool stPinchSegment_getBlockOrientation(stPinchSegment *segment) {
-    return segment->blockOrientation;
+    return stPinchSegment_orientation(segment);
 }
 
 void stPinchSegment_setBlockOrientation(stPinchSegment *segment, bool orientation) {
-    segment->blockOrientation = orientation;
+    stPinchSegment_setBlockAndOrientation(segment, stPinchSegment_block(segment), orientation);
 }
 
 stPinchSegment *stPinchSegment_get5Prime(stPinchSegment *segment) {
@@ -380,7 +396,7 @@ void stPinchSegment_split(stPinchSegment *segment, int64_t leftSideOfSplitPoint)
                 block->tailSegment = segment2;
             }
             block2 = stPinchBlock_construct2(segment);
-            segment->blockOrientation = 0; //This gets sets positive by default.
+            stPinchSegment_setBlockOrientation(segment, 0); //This gets sets positive by default.
             pSegment = segment2;
         }
         while ((segment = stPinchBlockIt_getNext(&blockIt)) != NULL) {
@@ -406,20 +422,21 @@ void stPinchSegment_split(stPinchSegment *segment, int64_t leftSideOfSplitPoint)
 }
 
 void stPinchSegment_putSegmentFirstInBlock(stPinchSegment *segment) {
-    if(segment->block != NULL) {
-        if(segment->block->headSegment != segment) {
-            stPinchSegment *pBlockSegment = segment->block->headSegment;
+    stPinchBlock *block = stPinchSegment_block(segment);
+    if(block != NULL) {
+        if(block->headSegment != segment) {
+            stPinchSegment *pBlockSegment = block->headSegment;
             while(pBlockSegment->nBlockSegment != segment) {
                 pBlockSegment = pBlockSegment->nBlockSegment;
                 assert(pBlockSegment != NULL);
             }
             pBlockSegment->nBlockSegment = segment->nBlockSegment;
             if(segment->nBlockSegment == NULL) {
-                assert(segment->block->tailSegment == segment);
-                segment->block->tailSegment = pBlockSegment;
+                assert(block->tailSegment == segment);
+                block->tailSegment = pBlockSegment;
             }
-            segment->nBlockSegment = segment->block->headSegment;
-            segment->block->headSegment = segment;
+            segment->nBlockSegment = block->headSegment;
+            block->headSegment = segment;
         }
     }
 }
@@ -1126,7 +1143,7 @@ static void merge3Prime(stPinchSegment *segment) {
     stPinchSegment *nSegment = segment->nSegment;
     assert(nSegment != NULL && nSegment != segment);
     stPinchThread_indexInvalidate(segment->thread);
-    assert(nSegment->block == NULL);
+    assert(stPinchSegment_block(nSegment) == NULL);
     assert(nSegment->nSegment != NULL);
     segment->nSegment = nSegment->nSegment;
     nSegment->nSegment->pSegment = segment;
@@ -1137,7 +1154,7 @@ static void merge5Prime(stPinchSegment *segment) {
     stPinchSegment *pSegment = segment->pSegment;
     assert(pSegment != NULL && pSegment != segment);
     stPinchThread_indexInvalidate(segment->thread);
-    assert(pSegment->block == NULL);
+    assert(stPinchSegment_block(pSegment) == NULL);
     segment->pSegment = pSegment->pSegment;
     if (pSegment->pSegment != NULL) {
         pSegment->pSegment->nSegment = segment;
@@ -1647,7 +1664,7 @@ static stPinchBlock *splitBlockUsingUndoBlock(stPinchBlock *block, stPinchSegmen
             stPinchBlock_setModifiedFlag(block, 1); // Mark the old block as modified
             newBlock->headSegment = segment;
             while (i < endi) {
-                segment->block = newBlock;
+                stPinchSegment_setBlockAndOrientation(segment, newBlock, stPinchSegment_orientation(segment));
                 i++;
                 if (i < endi) {
                     segment = segment->nBlockSegment;
