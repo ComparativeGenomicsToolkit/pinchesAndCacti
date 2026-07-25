@@ -32,9 +32,13 @@ struct _stPinchThreadSet {
  * are filled in and tightened as lookups walk over them, so the walks stay short
  * without any index maintenance being needed on a split.
  */
-#define ST_PINCH_INDEX_BUCKET_BITS 9
-//coarsen the buckets rather than let the index of a very long thread get out of hand
-#define ST_PINCH_INDEX_MAX_BUCKETS (INT64_C(1) << 20)
+//Buckets are sized so that each spans roughly this many segments.  Sizing them by how
+//finely the thread is actually broken up, rather than by a fixed number of bases, is what
+//keeps lookups cheap on a highly shattered graph: a fixed bucket that holds a handful of
+//segments in a pangenome holds hundreds of them at high divergence.  It also means the
+//index costs memory in proportion to segments rather than to thread length, so a long
+//barely-pinched thread pays almost nothing.
+#define ST_PINCH_INDEX_SEGMENTS_PER_BUCKET 4
 
 struct _stPinchThread {
     int64_t name;
@@ -43,6 +47,8 @@ struct _stPinchThread {
     stPinchSegment *firstSegment;
     stPinchSegment **index;
     int64_t indexLength;
+    int64_t segmentCount;
+    int64_t indexResizeAt; //resize once the thread has this many segments
     int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
     bool indexStale; //set when a merge frees a segment the index may still point at
 };
@@ -313,6 +319,25 @@ void stPinchSegment_destruct(stPinchSegment *segment) {
 }
 
 /*
+ * Rebuild the index at a bucket size suited to how many segments the thread now has.
+ * Called whenever the segment count doubles, so the work is geometric and amortizes to
+ * O(1) per split.  Entries are left empty; lookups fill them back in as they walk.
+ */
+static void stPinchThread_indexResize(stPinchThread *thread) {
+    int64_t targetBuckets = thread->segmentCount / ST_PINCH_INDEX_SEGMENTS_PER_BUCKET + 1;
+    int32_t shift = 0;
+    while (shift < 62 && (thread->length >> shift) > targetBuckets) {
+        shift++;
+    }
+    free(thread->index);
+    thread->indexShift = shift;
+    thread->indexLength = (thread->length >> shift) + 1;
+    thread->index = st_calloc(thread->indexLength, sizeof(stPinchSegment *));
+    thread->indexStale = 0;
+    thread->indexResizeAt = thread->segmentCount * 2;
+}
+
+/*
  * Point the one index bucket that starts at or after the new segment at it, if that
  * is tighter than what is already there.  Only a single bucket is touched, so a split
  * stays O(1); the rest of the index is brought up to date lazily by later lookups.
@@ -336,6 +361,7 @@ static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *se
  * so in practice this costs one memset per thread rather than one per merge.
  */
 static void stPinchThread_indexInvalidate(stPinchThread *thread) {
+    thread->segmentCount--;
     thread->indexStale = 1;
 }
 
@@ -365,7 +391,13 @@ static stPinchSegment *stPinchSegment_splitP(stPinchSegment *segment, int64_t le
     rightSegment->pSegment = segment;
     rightSegment->nSegment = nSegment;
     nSegment->pSegment = rightSegment;
-    stPinchThread_indexTighten(segment->thread, rightSegment);
+    stPinchThread *thread = segment->thread;
+    thread->segmentCount++;
+    if (thread->segmentCount >= thread->indexResizeAt) {
+        stPinchThread_indexResize(thread);
+    } else {
+        stPinchThread_indexTighten(thread, rightSegment);
+    }
     return rightSegment;
 }
 
@@ -687,13 +719,9 @@ static stPinchThread *stPinchThread_construct(int64_t name, int64_t start, int64
     thread->name = name;
     thread->start = start;
     thread->length = length;
-    thread->indexShift = ST_PINCH_INDEX_BUCKET_BITS;
-    while (thread->indexShift < 62 && (length >> thread->indexShift) >= ST_PINCH_INDEX_MAX_BUCKETS) {
-        thread->indexShift++;
-    }
-    thread->indexLength = (length >> thread->indexShift) + 1;
-    thread->index = st_calloc(thread->indexLength, sizeof(stPinchSegment *));
-    thread->indexStale = 0;
+    thread->index = NULL;
+    thread->segmentCount = 1;
+    stPinchThread_indexResize(thread);
     stPinchSegment *segment = stPinchSegment_construct(start, thread);
     stPinchSegment *terminatorSegment = stPinchSegment_construct(start + length, thread);
     segment->nSegment = terminatorSegment;
