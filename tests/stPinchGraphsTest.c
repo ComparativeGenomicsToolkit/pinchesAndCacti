@@ -1385,10 +1385,126 @@ static void testStPinchPartialUndo_random(CuTest *testCase) {
     }
 }
 
+/*
+ * Segments are reachable two ways: by walking the 3' linked list, and by the per-thread
+ * coordinate index that stPinchThread_getSegment consults.  These tests check the two
+ * agree.  Threads are deliberately sized to span many index buckets, because a thread
+ * shorter than a single bucket exercises none of the bucket scanning or filling.
+ */
+static stPinchSegment *getSegmentByScan(stPinchThread *thread, int64_t coordinate) {
+    stPinchSegment *segment = stPinchThread_getFirst(thread);
+    while (segment != NULL) {
+        if (coordinate >= stPinchSegment_getStart(segment)
+                && coordinate < stPinchSegment_getStart(segment) + stPinchSegment_getLength(segment)) {
+            return segment;
+        }
+        segment = stPinchSegment_get3Prime(segment);
+    }
+    return NULL;
+}
+
+static void checkThreadIndex(CuTest *testCase, stPinchThreadSet *threadSet) {
+    stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
+    stPinchThread *thread;
+    while ((thread = stPinchThreadSetIt_getNext(&threadIt)) != NULL) {
+        int64_t start = stPinchThread_getStart(thread);
+        int64_t length = stPinchThread_getLength(thread);
+
+        //the ends of the thread must line up with the segment list
+        stPinchSegment *first = stPinchThread_getFirst(thread);
+        CuAssertTrue(testCase, first != NULL);
+        CuAssertPtrEquals(testCase, NULL, stPinchSegment_get5Prime(first));
+        CuAssertIntEquals(testCase, start, stPinchSegment_getStart(first));
+        CuAssertPtrEquals(testCase, getSegmentByScan(thread, start), first);
+        CuAssertPtrEquals(testCase, getSegmentByScan(thread, start + length - 1), stPinchThread_getLast(thread));
+        CuAssertPtrEquals(testCase, NULL, stPinchSegment_get3Prime(stPinchThread_getLast(thread)));
+
+        //off either end
+        CuAssertPtrEquals(testCase, NULL, stPinchThread_getSegment(thread, start - 1));
+        CuAssertPtrEquals(testCase, NULL, stPinchThread_getSegment(thread, start + length));
+
+        //every coordinate, ascending then descending then scattered.  the orders matter:
+        //the index fills itself in as lookups walk over it, so a purely ascending sweep
+        //would hide any staleness the other orders run into
+        for (int64_t pass = 0; pass < 3; pass++) {
+            for (int64_t i = 0; i < length; i++) {
+                int64_t offset = pass == 0 ? i : (pass == 1 ? length - 1 - i : st_randomInt(0, length));
+                int64_t coordinate = start + offset;
+                CuAssertPtrEquals(testCase, getSegmentByScan(thread, coordinate),
+                        stPinchThread_getSegment(thread, coordinate));
+            }
+        }
+    }
+}
+
+static void testStPinchThread_getSegment_randomTests(CuTest *testCase) {
+    for (int64_t test = 0; test < 20; test++) {
+        st_logInfo("Starting random segment index test %" PRIi64 "\n", test);
+        stPinchThreadSet *threadSet = stPinchThreadSet_construct();
+        int64_t threadNumber = st_randomInt(2, 6);
+        for (int64_t threadIndex = 0; threadIndex < threadNumber; threadIndex++) {
+            //straddle the bucket size so sub-bucket, few-bucket and many-bucket threads all appear
+            stPinchThreadSet_addThread(threadSet, threadIndex + 4, st_randomInt(0, 100), st_randomInt(1, 4000));
+        }
+
+        //splits on their own
+        double threshold = st_random();
+        while (st_random() > threshold) {
+            stPinch pinch = stPinchThreadSet_getRandomPinch(threadSet);
+            stPinchThread_split(stPinchThreadSet_getThread(threadSet, pinch.name1), pinch.start1);
+        }
+        checkThreadIndex(testCase, threadSet);
+
+        //then pinches, which split as a side effect and build blocks
+        threshold = st_random();
+        while (st_random() > threshold) {
+            stPinch pinch = stPinchThreadSet_getRandomPinch(threadSet);
+            stPinchThread_pinch(stPinchThreadSet_getThread(threadSet, pinch.name1),
+                    stPinchThreadSet_getThread(threadSet, pinch.name2), pinch.start1, pinch.start2, pinch.length,
+                    pinch.strand);
+        }
+        checkThreadIndex(testCase, threadSet);
+
+        //joining trivial boundaries frees segments, which the index has to notice
+        stPinchThreadSet_joinTrivialBoundaries(threadSet);
+        checkThreadIndex(testCase, threadSet);
+
+        stPinchThreadSet_destruct(threadSet);
+    }
+}
+
+static void testStPinchThread_getSegment_longThread(CuTest *testCase) {
+    //long enough that the index has to use coarser buckets than its default
+    stPinchThreadSet *threadSet = stPinchThreadSet_construct();
+    int64_t start = 1, length = INT64_C(3000000000);
+    stPinchThread *thread = stPinchThreadSet_addThread(threadSet, 0, start, length);
+    int64_t splits[] = { 0, 1, 2, 1000, 1000000, 1500000000, length - 2 };
+    for (int64_t i = 0; i < (int64_t) (sizeof(splits) / sizeof(splits[0])); i++) {
+        stPinchThread_split(thread, start + splits[i]);
+    }
+    //probe around every split point, and at both ends, in descending order
+    for (int64_t i = (int64_t) (sizeof(splits) / sizeof(splits[0])) - 1; i >= 0; i--) {
+        for (int64_t delta = -1; delta <= 2; delta++) {
+            int64_t coordinate = start + splits[i] + delta;
+            if (coordinate >= start && coordinate < start + length) {
+                CuAssertPtrEquals(testCase, getSegmentByScan(thread, coordinate),
+                        stPinchThread_getSegment(thread, coordinate));
+            }
+        }
+    }
+    CuAssertPtrEquals(testCase, stPinchThread_getFirst(thread), stPinchThread_getSegment(thread, start));
+    CuAssertPtrEquals(testCase, stPinchThread_getLast(thread), stPinchThread_getSegment(thread, start + length - 1));
+    CuAssertPtrEquals(testCase, NULL, stPinchThread_getSegment(thread, start - 1));
+    CuAssertPtrEquals(testCase, NULL, stPinchThread_getSegment(thread, start + length));
+    stPinchThreadSet_destruct(threadSet);
+}
+
 CuSuite* stPinchGraphsTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
     SUITE_ADD_TEST(suite, testStPinchThreadSet);
     SUITE_ADD_TEST(suite, testStPinchThreadAndSegment);
+    SUITE_ADD_TEST(suite, testStPinchThread_getSegment_randomTests);
+    SUITE_ADD_TEST(suite, testStPinchThread_getSegment_longThread);
     SUITE_ADD_TEST(suite, testStPinchBlock_NoSplits);
     SUITE_ADD_TEST(suite, testStPinchBlock_Splits);
     SUITE_ADD_TEST(suite, testStPinchThread_pinch);

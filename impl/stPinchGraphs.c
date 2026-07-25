@@ -9,6 +9,7 @@
 //
 
 #include <stdlib.h>
+#include <string.h>
 #include "sonLib.h"
 #include "stPinchGraphs.h"
 
@@ -17,11 +18,33 @@ struct _stPinchThreadSet {
     stHash *threadsHash;
 };
 
+/*
+ * Segments of a thread are kept in a doubly-linked list ordered by start coordinate.
+ * Random access by coordinate used to go through a per-thread AVL tree holding every
+ * segment, which cost ~48 bytes of heap per segment (a 32 byte avl_node plus malloc
+ * overhead) and dominated memory in segment-rich graphs.  It is replaced here by a
+ * coarse index: one segment pointer per 512 bases of thread (coarser still on very long
+ * threads), which costs 8 bytes per bucket regardless of how many segments there are.
+ *
+ * Index invariant: if index[k] is not NULL then index[k]->start <= the first
+ * coordinate of bucket k.  So a lookup can always start at index[k] (or at the
+ * nearest non-NULL entry at or before k) and walk 3' to reach the target.  Entries
+ * are filled in and tightened as lookups walk over them, so the walks stay short
+ * without any index maintenance being needed on a split.
+ */
+#define ST_PINCH_INDEX_BUCKET_BITS 9
+//coarsen the buckets rather than let the index of a very long thread get out of hand
+#define ST_PINCH_INDEX_MAX_BUCKETS (INT64_C(1) << 20)
+
 struct _stPinchThread {
     int64_t name;
     int64_t start;
     int64_t length;
-    stSortedSet *segments;
+    stPinchSegment *firstSegment;
+    stPinchSegment **index;
+    int64_t indexLength;
+    int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
+    bool indexStale; //set when a merge frees a segment the index may still point at
 };
 
 struct _stPinchSegment {
@@ -268,6 +291,33 @@ void stPinchSegment_destruct(stPinchSegment *segment) {
     free(segment);
 }
 
+/*
+ * Point the one index bucket that starts at or after the new segment at it, if that
+ * is tighter than what is already there.  Only a single bucket is touched, so a split
+ * stays O(1); the rest of the index is brought up to date lazily by later lookups.
+ */
+static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *segment) {
+    int64_t offset = segment->start - thread->start;
+    //round the offset up to a bucket boundary without risking overflow on huge threads
+    int64_t bucket = (offset >> thread->indexShift) + ((offset & ((INT64_C(1) << thread->indexShift) - 1)) != 0);
+    if (bucket < thread->indexLength) {
+        stPinchSegment *cur = thread->index[bucket];
+        if (cur == NULL || cur->start < segment->start) {
+            thread->index[bucket] = segment;
+        }
+    }
+}
+
+/*
+ * Called when a merge is about to free a segment.  The index may point at it from
+ * buckets we cannot cheaply enumerate, so the whole index is dropped and rebuilt by
+ * subsequent lookups.  Merging is done in bulk passes (stPinchThreadSet_joinTrivialBoundaries),
+ * so in practice this costs one memset per thread rather than one per merge.
+ */
+static void stPinchThread_indexInvalidate(stPinchThread *thread) {
+    thread->indexStale = 1;
+}
+
 int stPinchSegment_compareBySequencePosition(const stPinchSegment *segment1, const stPinchSegment *segment2) {
     return segment1->start < segment2->start ? -1 : (segment1->start > segment2->start ? 1 : 0);
 }
@@ -294,7 +344,7 @@ static stPinchSegment *stPinchSegment_splitP(stPinchSegment *segment, int64_t le
     rightSegment->pSegment = segment;
     rightSegment->nSegment = nSegment;
     nSegment->pSegment = rightSegment;
-    stSortedSet_insert(segment->thread->segments, rightSegment);
+    stPinchThread_indexTighten(segment->thread, rightSegment);
     return rightSegment;
 }
 
@@ -389,25 +439,50 @@ int64_t stPinchThread_getLength(stPinchThread *thread) {
 }
 
 stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordinate) {
-    stPinchSegment segment;
-    segment.start = coordinate;
-    stPinchSegment *segment2 = stSortedSet_searchLessThanOrEqual(thread->segments, &segment);
-    if (segment2 == NULL) {
+    int64_t offset = coordinate - thread->start;
+    if (offset < 0 || offset >= thread->length) {
         return NULL;
     }
-    assert(stPinchSegment_getStart(segment2) <= coordinate);
-    if (stPinchSegment_getStart(segment2) + stPinchSegment_getLength(segment2) <= coordinate) {
-        return NULL;
+    if (thread->indexStale) {
+        memset(thread->index, 0, sizeof(stPinchSegment *) * thread->indexLength);
+        thread->indexStale = 0;
     }
-    return segment2;
+    int64_t target = offset >> thread->indexShift;
+    assert(target < thread->indexLength);
+    //back up to the nearest bucket we have an entry for; every bucket we walk over
+    //below gets filled in, so this scan is short except on the very first lookups
+    int64_t bucket = target;
+    while (bucket > 0 && thread->index[bucket] == NULL) {
+        bucket--;
+    }
+    stPinchSegment *segment = thread->index[bucket];
+    if (segment == NULL) {
+        segment = thread->firstSegment;
+    }
+    assert(segment->start <= thread->start + (bucket << thread->indexShift));
+    while (1) {
+        //the terminator segment starts at thread->start + thread->length, so it always
+        //compares greater than a coordinate we accepted above and is never stepped onto
+        int64_t end = segment->nSegment->start;
+        while (bucket <= target && thread->start + (bucket << thread->indexShift) < end) {
+            thread->index[bucket] = segment;
+            bucket++;
+        }
+        if (end > coordinate) {
+            break;
+        }
+        segment = segment->nSegment;
+    }
+    assert(segment->start <= coordinate);
+    return segment;
 }
 
 stPinchSegment *stPinchThread_getFirst(stPinchThread *thread) {
-    return stSortedSet_getFirst(thread->segments);
+    return thread->firstSegment;
 }
 
 stPinchSegment *stPinchThread_getLast(stPinchThread *thread) {
-    return stSortedSet_getLast(thread->segments);
+    return stPinchThread_getSegment(thread, thread->start + thread->length - 1);
 }
 
 void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint) {
@@ -431,7 +506,7 @@ void stPinchThread_joinTrivialBoundaries(stPinchThread *thread) {
                         segment->nSegment = nSegment->nSegment;
                         assert(nSegment->nSegment != NULL);
                         nSegment->nSegment->pSegment = segment;
-                        stSortedSet_remove(thread->segments, nSegment);
+                        stPinchThread_indexInvalidate(thread);
                         stPinchSegment_destruct(nSegment);
                         continue;
                     }
@@ -590,20 +665,29 @@ static stPinchThread *stPinchThread_construct(int64_t name, int64_t start, int64
     thread->name = name;
     thread->start = start;
     thread->length = length;
-    thread->segments = stSortedSet_construct3((int(*)(const void *, const void *)) stPinchSegment_compareBySequencePosition,
-            (void(*)(void *)) stPinchSegment_destruct);
+    thread->indexShift = ST_PINCH_INDEX_BUCKET_BITS;
+    while (thread->indexShift < 62 && (length >> thread->indexShift) >= ST_PINCH_INDEX_MAX_BUCKETS) {
+        thread->indexShift++;
+    }
+    thread->indexLength = (length >> thread->indexShift) + 1;
+    thread->index = st_calloc(thread->indexLength, sizeof(stPinchSegment *));
+    thread->indexStale = 0;
     stPinchSegment *segment = stPinchSegment_construct(start, thread);
     stPinchSegment *terminatorSegment = stPinchSegment_construct(start + length, thread);
     segment->nSegment = terminatorSegment;
     terminatorSegment->pSegment = segment;
-    stSortedSet_insert(thread->segments, segment);
+    thread->firstSegment = segment;
     return thread;
 }
 
 static void stPinchThread_destruct(stPinchThread *thread) {
-    stPinchSegment *segment = stPinchThread_getLast(thread);
-    free(segment->nSegment);
-    stSortedSet_destruct(thread->segments);
+    stPinchSegment *segment = thread->firstSegment;
+    while (segment != NULL) {
+        stPinchSegment *nSegment = segment->nSegment;
+        stPinchSegment_destruct(segment); //also tears down the segment's block, if any
+        segment = nSegment;
+    }
+    free(thread->index);
     free(thread);
 }
 
@@ -1041,7 +1125,7 @@ stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchE
 static void merge3Prime(stPinchSegment *segment) {
     stPinchSegment *nSegment = segment->nSegment;
     assert(nSegment != NULL && nSegment != segment);
-    stSortedSet_remove(segment->thread->segments, nSegment);
+    stPinchThread_indexInvalidate(segment->thread);
     assert(nSegment->block == NULL);
     assert(nSegment->nSegment != NULL);
     segment->nSegment = nSegment->nSegment;
@@ -1052,11 +1136,13 @@ static void merge3Prime(stPinchSegment *segment) {
 static void merge5Prime(stPinchSegment *segment) {
     stPinchSegment *pSegment = segment->pSegment;
     assert(pSegment != NULL && pSegment != segment);
-    stSortedSet_remove(segment->thread->segments, pSegment);
+    stPinchThread_indexInvalidate(segment->thread);
     assert(pSegment->block == NULL);
     segment->pSegment = pSegment->pSegment;
     if (pSegment->pSegment != NULL) {
         pSegment->pSegment->nSegment = segment;
+    } else {
+        segment->thread->firstSegment = segment;
     }
     assert(pSegment->start < segment->start);
     segment->start = pSegment->start;
