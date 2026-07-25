@@ -202,6 +202,11 @@ uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block) {
     return block->numSupportingHomologies;
 }
 
+void stPinchBlock_setNumSupportingHomologies(stPinchBlock *block, uint64_t numSupportingHomologies) {
+    assert(numSupportingHomologies < (UINT64_C(1) << 62));
+    block->numSupportingHomologies = numSupportingHomologies;
+}
+
 /*
  * Sets a bit of a chosen flag
  */
