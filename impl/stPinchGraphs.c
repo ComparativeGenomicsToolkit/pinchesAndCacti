@@ -343,6 +343,14 @@ static void stPinchThread_indexResize(stPinchThread *thread) {
  * stays O(1); the rest of the index is brought up to date lazily by later lookups.
  */
 static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *segment) {
+    if (thread->indexStale) {
+        //A merge has freed segments this index still points at, and only a lookup clears
+        //them out, so reading a bucket here would dereference freed memory.  The index is
+        //a hint, so skipping the tighten costs nothing: the next lookup rebuilds it.
+        //Splits reach threads that have had no lookup since the merge, because
+        //stPinchSegment_split splits every segment in the block and a block spans threads.
+        return;
+    }
     int64_t offset = segment->start - thread->start;
     //round the offset up to a bucket boundary without risking overflow on huge threads
     int64_t bucket = (offset >> thread->indexShift) + ((offset & ((INT64_C(1) << thread->indexShift) - 1)) != 0);
