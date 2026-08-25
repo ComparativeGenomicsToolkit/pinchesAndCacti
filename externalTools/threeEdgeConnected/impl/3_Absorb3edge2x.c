@@ -117,7 +117,7 @@ typedef struct __3EdgeVars {
     //******************************************************************************
     stList *list, *list2;
     //
-    stSortedSet *adjacencyEdgesSet;
+    struct adjacencyEdgeChunk *adjacencyEdgeChunks;
 } _3EdgeVars;
 
 struct Frame {
@@ -167,16 +167,34 @@ static void addToStack(int w, int v, int u, adjacentG *edge, int start, stList *
     stList_append(stack, frame);
 }
 
+/*Adjacency cells are only ever released wholesale, at the end of the run, so they are bump
+ allocated out of chunks rather than tracked one by one. The sorted set this replaces cost a
+ 32 byte avl node for every 16 byte cell, and its lookups ran in production because the build
+ forces -UNDEBUG, so the assert in the destructor was a second full tree walk per removal.
+ */
+#define ADJACENCY_EDGE_CHUNK_SIZE 8192
+
+struct adjacencyEdgeChunk {
+    struct adjacencyEdgeChunk *next;
+    int64_t used;
+    adjacentG cells[ADJACENCY_EDGE_CHUNK_SIZE];
+};
+
 static adjacentG *adjacencyEdge_construct(_3EdgeVars *ev) {
-    adjacentG *g = st_malloc(sizeof(struct adjacent_with_u_in_G));
-    stSortedSet_insert(ev->adjacencyEdgesSet, g);
-    return g;
+    struct adjacencyEdgeChunk *chunk = ev->adjacencyEdgeChunks;
+    if (chunk == NULL || chunk->used == ADJACENCY_EDGE_CHUNK_SIZE) {
+        chunk = st_malloc(sizeof(struct adjacencyEdgeChunk));
+        chunk->used = 0;
+        chunk->next = ev->adjacencyEdgeChunks;
+        ev->adjacencyEdgeChunks = chunk;
+    }
+    return &(chunk->cells[chunk->used++]);
 }
 
 static void adjacencyEdge_destruct(adjacentG *g, _3EdgeVars *ev) {
-    assert(stSortedSet_search(ev->adjacencyEdgesSet, g) != NULL);
-    stSortedSet_remove(ev->adjacencyEdgesSet, g);
-    free(g);
+    /*The cell is dropped from the list that held it and released with its chunk at the end.*/
+    (void) g;
+    (void) ev;
 }
 
 static void three_edge_connectP(int w, int v, struct Frame *frame, stList *stack, _3EdgeVars *ev);
@@ -501,7 +519,6 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
 
     //*********************************Memory allocation
     _3EdgeVars *ev = st_calloc(1, sizeof(_3EdgeVars));
-    ev->adjacencyEdgesSet = stSortedSet_construct2(free);
     ev->list = stList_construct3(0, (void(*)(void *)) stList_destruct);
 
     ev->LG = (adjacentG**) st_malloc(Vnum * sizeof(struct adjacent_with_u_in_G *));
@@ -603,8 +620,11 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
     //Cleanup
     /////////////
 
-    stSortedSet_destruct(ev->adjacencyEdgesSet); //This gets rid of all remaining ev->edges
-    ev->adjacencyEdgesSet = NULL;
+    while (ev->adjacencyEdgeChunks != NULL) { //This gets rid of all remaining ev->edges
+        struct adjacencyEdgeChunk *nextChunk = ev->adjacencyEdgeChunks->next;
+        free(ev->adjacencyEdgeChunks);
+        ev->adjacencyEdgeChunks = nextChunk;
+    }
     stList *returnList = ev->list; // The list to return, saving a pointer to it before cleaning up ev
     free(ev->LG);
     free(ev->LB);
