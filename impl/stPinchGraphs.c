@@ -62,6 +62,7 @@ struct _stPinchThread {
     bool indexStale; //set when a merge frees a segment the index may still point at
     stPinchSegment *terminatorSegment; //the sentinel after the last segment; never merged away, so its pSegment is always the last segment
     void *userData; //owned by the caller, NULL until set (caf stores the thread's event here)
+    int64_t threadIndex; //position in the thread set, so callers can keep per-thread arrays
 };
 
 /*
@@ -595,6 +596,10 @@ void *stPinchThread_getUserData(stPinchThread *thread) {
     return thread->userData;
 }
 
+int64_t stPinchThread_getIndex(stPinchThread *thread) {
+    return thread->threadIndex;
+}
+
 void stPinchThread_setUserData(stPinchThread *thread, void *userData) {
     thread->userData = userData;
 }
@@ -936,6 +941,7 @@ stPinchThread *stPinchThreadSet_addThread(stPinchThreadSet *threadSet, int64_t n
     stPinchThread *thread = stPinchThread_construct(name, start, length);
     assert(stPinchThreadSet_getThread(threadSet, name) == NULL);
     stHash_insert(threadSet->threadsHash, thread, thread);
+    thread->threadIndex = stList_length(threadSet->threads);
     stList_append(threadSet->threads, thread);
     return thread;
 }
@@ -1105,14 +1111,20 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     return adjacencyComponents;
 }
 
-stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
-    stUnionFind *components = stUnionFind_construct();
-    stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
-    stPinchThread *thread;
+static int64_t threadComponentFind(int64_t *parent, int64_t i) {
+    while (parent[i] != i) {
+        parent[i] = parent[parent[i]]; //path halving
+        i = parent[i];
+    }
+    return i;
+}
 
-    //Make a component for each thread.
-    while ((thread = stPinchThreadSetIt_getNext(&threadIt)) != NULL) {
-        stUnionFind_add(components, thread);
+stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
+    //Union-find over thread indices in a flat array: one entry per thread, no hashing per segment
+    int64_t threadNumber = stPinchThreadSet_getSize(threadSet);
+    int64_t *parent = st_malloc((threadNumber > 0 ? threadNumber : 1) * sizeof(int64_t));
+    for (int64_t i = 0; i < threadNumber; i++) {
+        parent[i] = i;
     }
 
     //Now join components progressively according to blocks
@@ -1122,24 +1134,30 @@ stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
         stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
         stPinchSegment *segment = stPinchBlockIt_getNext(&segmentIt);
         assert(segment != NULL);
-        stPinchThread *firstThread = stPinchSegment_getThread(segment);
+        int64_t root = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
         while ((segment = stPinchBlockIt_getNext(&segmentIt)) != NULL) {
-            stUnionFind_union(components, firstThread, stPinchSegment_getThread(segment));
+            int64_t root2 = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
+            if (root2 != root) {
+                parent[root2] = root;
+            }
         }
     }
 
-    //Get a list of the components
+    //Get a list of the components, each holding its threads in thread set order
     stSortedSet *threadComponentsSet = stSortedSet_construct2((void(*)(void *)) stList_destruct);
-    stUnionFindIt *componentsIt = stUnionFind_getIterator(components);
-    stSet *component;
-    while ((component = stUnionFindIt_getNext(componentsIt)) != NULL) {
-        stList *componentList = stSet_getList(component);
-        stSortedSet_insert(threadComponentsSet, componentList);
+    stList **componentLists = st_calloc(threadNumber > 0 ? threadNumber : 1, sizeof(stList *));
+    for (int64_t i = 0; i < threadNumber; i++) {
+        int64_t root = threadComponentFind(parent, i);
+        if (componentLists[root] == NULL) {
+            componentLists[root] = stList_construct();
+            stSortedSet_insert(threadComponentsSet, componentLists[root]);
+        }
+        stList_append(componentLists[root], stList_get(threadSet->threads, i));
     }
 
     //Cleanup
-    stUnionFind_destructIterator(componentsIt);
-    stUnionFind_destruct(components);
+    free(componentLists);
+    free(parent);
     return threadComponentsSet;
 }
 
@@ -1253,28 +1271,49 @@ int64_t stPinchEnd_getNumberOfConnectedPinchEnds(stPinchEnd *end) {
     return i;
 }
 
-static void appendBlocksSegments(stPinchBlock *block, stList *list) {
-    stPinchBlockIt it = stPinchBlock_getSegmentIterator(block);
+/*
+ * The segments of one or two blocks, sorted by thread and then coordinate, in a stack buffer when they
+ * fit. These predicates run once per chain link per cactus graph build, so a list and its sort per call
+ * were a measurable part of every build.
+ */
+#define SEGMENT_BUFFER_SIZE 64
+
+static int stPinchSegment_compareP(const void *a, const void *b) {
+    return stPinchSegment_compare(*(stPinchSegment * const *) a, *(stPinchSegment * const *) b);
+}
+
+static stPinchSegment **getSortedBlockSegments(stPinchBlock *block1, stPinchBlock *block2, stPinchSegment **buffer, int64_t *n) {
+    *n = stPinchBlock_getDegree(block1) + (block2 != block1 ? stPinchBlock_getDegree(block2) : 0);
+    stPinchSegment **segments = *n <= SEGMENT_BUFFER_SIZE ? buffer : st_malloc(*n * sizeof(stPinchSegment *));
+    int64_t i = 0;
+    stPinchBlockIt it = stPinchBlock_getSegmentIterator(block1);
     stPinchSegment *segment;
-    while((segment = stPinchBlockIt_getNext(&it))) {
-        stList_append(list, segment);
+    while ((segment = stPinchBlockIt_getNext(&it)) != NULL) {
+        segments[i++] = segment;
     }
+    if (block2 != block1) {
+        it = stPinchBlock_getSegmentIterator(block2);
+        while ((segment = stPinchBlockIt_getNext(&it)) != NULL) {
+            segments[i++] = segment;
+        }
+    }
+    assert(i == *n);
+    //The comparison is a total order (no two distinct segments share a thread and start), so any sort gives the same order
+    qsort(segments, *n, sizeof(stPinchSegment *), stPinchSegment_compareP);
+    return segments;
 }
 
 bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock *otherBlock) {
-    //Construct list of segments in end and otherEnd's blocks.
-    stList *l = stList_construct();
-    appendBlocksSegments(stPinchEnd_getBlock(end), l);
-    if(stPinchEnd_getBlock(end) != otherBlock) {
-        appendBlocksSegments(otherBlock, l);
-    }
-    //Sort segments by thread and then coordinate.
-    stList_sort(l, (int (*)(const void *, const void *))stPinchSegment_compare);
+    //Segments in end and otherEnd's blocks, sorted by thread and then coordinate.
+    stPinchSegment *buffer[SEGMENT_BUFFER_SIZE];
+    int64_t n;
+    stPinchSegment **l = getSortedBlockSegments(stPinchEnd_getBlock(end), otherBlock, buffer, &n);
+    bool selfLoop = 0;
 
     //Walk through list of segments
-    for(int64_t i=1; i<stList_length(l); i++) {
-        stPinchSegment *s1 = stList_get(l, i-1);
-        stPinchSegment *s2 = stList_get(l, i);
+    for(int64_t i=1; i<n; i++) {
+        stPinchSegment *s1 = l[i-1];
+        stPinchSegment *s2 = l[i];
         //If there exists two successive segments in the same thread from block's end that are joined by an interstitial sequence,
         //without an intervening segment from otherEnd's block then we have identified a self-loop.
         if(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(end) && //same block
@@ -1283,31 +1322,30 @@ bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock
            !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s1) && //contiguous
            stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2) /*contiguous*/) {
             assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
-            stList_destruct(l);
-            return 1;
+            selfLoop = 1;
+            break;
         }
     }
-    stList_destruct(l);
-    return 0;
+    if (l != buffer) {
+        free(l);
+    }
+    return selfLoop;
 }
 
-stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
-    //Construct list of segments in end and otherEnd's blocks.
-    stList *l = stList_construct();
-    appendBlocksSegments(stPinchEnd_getBlock(end), l);
-    if(stPinchEnd_getBlock(otherEnd) != stPinchEnd_getBlock(end)) {
-        appendBlocksSegments(stPinchEnd_getBlock(otherEnd), l);
-    }
-    //Sort segments by thread and then coordinate.
-    stList_sort(l, (int (*)(const void *, const void *))stPinchSegment_compare);
-
-    //List of segments to return.
-    stList *lengths = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
+/*
+ * The core of stPinchEnd_getSubSequenceLengthsConnectingEnds: calls lengthFn(length, extraArg) once per
+ * connecting subsequence, in the same order the list version appended them.
+ */
+static void stPinchEnd_forEachSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd,
+        void (*lengthFn)(int64_t, void *), void *extraArg) {
+    stPinchSegment *buffer[SEGMENT_BUFFER_SIZE];
+    int64_t n;
+    stPinchSegment **l = getSortedBlockSegments(stPinchEnd_getBlock(end), stPinchEnd_getBlock(otherEnd), buffer, &n);
 
     //Walk through list of segments
-    for(int64_t i=1; i<stList_length(l); i++) {
-        stPinchSegment *s1 = stList_get(l, i-1);
-        stPinchSegment *s2 = stList_get(l, i);
+    for(int64_t i=1; i<n; i++) {
+        stPinchSegment *s1 = l[i-1];
+        stPinchSegment *s2 = l[i];
         //If there exists two successive segments in different ends that are contigous add their length.
         if(stPinchSegment_getThread(s1) == stPinchSegment_getThread(s2)) { //same thread
             if(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(end)) { //case where first segment is from first block.
@@ -1320,7 +1358,7 @@ stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchE
                    !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(otherEnd), s1) &&
                    stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2)))) {
                    assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
-                   stList_append(lengths, stIntTuple_construct1(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1))));
+                   lengthFn(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1)), extraArg);
                }
             } else {
                 assert(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(otherEnd)); //case where first segment is from other block.
@@ -1328,12 +1366,66 @@ stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchE
                      !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(otherEnd), s1) &&
                      stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2)) { //contiguous
                     assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
-                    stList_append(lengths, stIntTuple_construct1(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1))));
+                    lengthFn(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1)), extraArg);
                 }
             }
         }
     }
-    stList_destruct(l);
+    if (l != buffer) {
+        free(l);
+    }
+}
+
+static void appendLengthAsIntTuple(int64_t length, void *lengths) {
+    stList_append(lengths, stIntTuple_construct1(length));
+}
+
+typedef struct _lengthBuffer {
+    int64_t buffer[SEGMENT_BUFFER_SIZE];
+    int64_t *lengths;
+    int64_t n, capacity;
+} LengthBuffer;
+
+static void appendLengthToBuffer(int64_t length, void *extraArg) {
+    LengthBuffer *b = extraArg;
+    if (b->n == b->capacity) {
+        int64_t *lengths = st_malloc(2 * b->capacity * sizeof(int64_t));
+        memcpy(lengths, b->lengths, b->n * sizeof(int64_t));
+        if (b->lengths != b->buffer) {
+            free(b->lengths);
+        }
+        b->lengths = lengths;
+        b->capacity *= 2;
+    }
+    b->lengths[b->n++] = length;
+}
+
+static int compareInt64(const void *a, const void *b) {
+    int64_t i = *(const int64_t *) a, j = *(const int64_t *) b;
+    return i < j ? -1 : (i > j ? 1 : 0);
+}
+
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
+    LengthBuffer b;
+    b.lengths = b.buffer;
+    b.n = 0;
+    b.capacity = SEGMENT_BUFFER_SIZE;
+    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthToBuffer, &b);
+    int64_t median = -1;
+    if (b.n > 0) {
+        qsort(b.lengths, b.n, sizeof(int64_t), compareInt64); //ascending, like stIntTuple_cmpFn on the list version
+        median = b.lengths[b.n / 2];
+    }
+    if (b.lengths != b.buffer) {
+        free(b.lengths);
+    }
+    return median;
+}
+
+stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
+    //List of lengths to return, in the order found.
+    stList *lengths = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
+    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthAsIntTuple, lengths);
     return lengths;
 }
 

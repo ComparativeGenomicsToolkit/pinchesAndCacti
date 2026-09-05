@@ -283,6 +283,11 @@ void *stPinchThread_getUserData(stPinchThread *thread);
 void stPinchThread_setUserData(stPinchThread *thread, void *userData);
 
 /*
+ * The thread's position in its thread set (0 for the first thread added), fixed for the thread's life.
+ */
+int64_t stPinchThread_getIndex(stPinchThread *thread);
+
+/*
  * Split the segment at the given thread and position in two, such
  * that there will be two segments, the left (or 5')-most of which
  * includes leftSideOfSplitPoint as its last base. If
@@ -580,6 +585,12 @@ bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock
  * (indirect) adjacencies connecting the two ends.
  */
 stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd);
+
+/*
+ * The median (element n/2 of the ascending sort) of the lengths stPinchEnd_getSubSequenceLengthsConnectingEnds
+ * would return, or -1 if there are none, computed without allocating.
+ */
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd);
 
 /*
  * Pinch structure. A pinch represents a gapless alignment between two
