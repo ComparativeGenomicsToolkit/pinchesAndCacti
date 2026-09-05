@@ -750,9 +750,11 @@ static void testStPinchThreadSet_getAdjacencyComponents(CuTest *testCase) {
     setup();
     //Quick check that it returns what we expect
     stPinchThread_pinch(thread1, thread2, 5, 5, 8, 1);
+    stPinchThreadSet_attachEnds(threadSet);
     stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
     CuAssertIntEquals(testCase, 4, stList_length(adjacencyComponents));
     stList_destruct(adjacencyComponents);
+    stPinchThreadSet_detachEnds(threadSet);
     teardown();
 }
 
@@ -761,8 +763,11 @@ static void testStPinchThreadSet_getAdjacencyComponents_randomTests(CuTest *test
     for (int64_t test = 0; test < 100; test++) {
         st_logInfo("Starting random adjacency component test %" PRIi64 "\n", test);
         stPinchThreadSet *threadSet = stPinchThreadSet_getRandomGraph();
+        CuAssertTrue(testCase, !stPinchThreadSet_endsAttached(threadSet));
+        stPinchThreadSet_attachEnds(threadSet);
+        CuAssertTrue(testCase, stPinchThreadSet_endsAttached(threadSet));
         stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
-        //Check all ends in one adjacency component
+        //Check all ends in one adjacency component, and that each end's record points at the component it is listed in
         stHash *ends = stHash_construct3(stPinchEnd_hashFn, stPinchEnd_equalsFn, NULL, NULL);
         for (int64_t i = 0; i < stList_length(adjacencyComponents); i++) {
             stList *adjacencyComponent = stList_get(adjacencyComponents, i);
@@ -770,15 +775,65 @@ static void testStPinchThreadSet_getAdjacencyComponents_randomTests(CuTest *test
                 stPinchEnd *end = stList_get(adjacencyComponent, j);
                 CuAssertPtrEquals(testCase, NULL, stHash_search(ends, end));
                 stHash_insert(ends, end, end);
+                CuAssertPtrEquals(testCase, end, stPinchEnd_getCanonical(end));
+                CuAssertPtrEquals(testCase, adjacencyComponent, stPinchEnd_getComponent(end));
+                stPinchEnd staticEnd = stPinchEnd_constructStatic(stPinchEnd_getBlock(end), stPinchEnd_getOrientation(end));
+                CuAssertPtrEquals(testCase, adjacencyComponent, stPinchEnd_getComponent(&staticEnd));
+                CuAssertPtrEquals(testCase, end, stPinchEnd_getCanonical(&staticEnd));
+                CuAssertPtrEquals(testCase, stPinchBlock_getEnd(stPinchEnd_getBlock(end), !stPinchEnd_getOrientation(end)), stPinchEnd_getOtherEnd(end));
+                //Every end reached through an adjacency from this end is in the same component
+                stSet *connectedEnds = stPinchEnd_getConnectedPinchEnds(end);
+                stSetIterator *it = stSet_getIterator(connectedEnds);
+                stPinchEnd *connectedEnd;
+                while ((connectedEnd = stSet_getNext(it)) != NULL) {
+                    CuAssertPtrEquals(testCase, adjacencyComponent, stPinchEnd_getComponent(connectedEnd));
+                }
+                stSet_destructIterator(it);
+                stSet_destruct(connectedEnds);
             }
         }
         stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
         int64_t blockNumber = 0;
-        while ((stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+        stPinchBlock *block;
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
             blockNumber++;
+            CuAssertTrue(testCase, stPinchBlock_getEnd(block, 0) != NULL);
+            CuAssertTrue(testCase, stPinchBlock_getEnd(block, 1) != NULL);
+            CuAssertPtrEquals(testCase, stPinchBlock_getEnd(block, 0), stHash_search(ends, stPinchBlock_getEnd(block, 0)));
+            CuAssertPtrEquals(testCase, stPinchBlock_getEnd(block, 1), stHash_search(ends, stPinchBlock_getEnd(block, 1)));
+            //The data slots start out empty and are independent per end
+            CuAssertPtrEquals(testCase, NULL, stPinchEnd_getData(stPinchBlock_getEnd(block, 0)));
+            stPinchEnd_setData(stPinchBlock_getEnd(block, 1), block);
+            CuAssertPtrEquals(testCase, NULL, stPinchEnd_getData(stPinchBlock_getEnd(block, 0)));
+            CuAssertPtrEquals(testCase, block, stPinchEnd_getData(stPinchBlock_getEnd(block, 1)));
         }
         CuAssertIntEquals(testCase, 2 * blockNumber, stHash_size(ends));
-        //Check all connected nodes in same adjacency component
+        stPinchThreadSet_clearEndData(threadSet);
+        blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            CuAssertPtrEquals(testCase, NULL, stPinchEnd_getData(stPinchBlock_getEnd(block, 1)));
+        }
+        //Destroying a block while attached leaves a dead record, and a later attach gives fresh records
+        if (blockNumber > 0) {
+            blockIt = stPinchThreadSet_getBlockIt(threadSet);
+            block = stPinchThreadSetBlockIt_getNext(&blockIt);
+            stPinchEnd *end = stPinchBlock_getEnd(block, 0);
+            stPinchBlock_destruct(block);
+            CuAssertPtrEquals(testCase, NULL, stPinchEnd_getBlock(end));
+        }
+        stPinchThreadSet_detachEnds(threadSet);
+        CuAssertTrue(testCase, !stPinchThreadSet_endsAttached(threadSet));
+        blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            CuAssertPtrEquals(testCase, NULL, stPinchBlock_getEnd(block, 0));
+        }
+        stPinchThreadSet_attachEnds(threadSet);
+        blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            CuAssertTrue(testCase, stPinchBlock_getEnd(block, 0) != NULL);
+            CuAssertPtrEquals(testCase, NULL, stPinchEnd_getComponent(stPinchBlock_getEnd(block, 0)));
+        }
+        //The thread set destructor frees the records of a still attached set
         stPinchThreadSet_destruct(threadSet);
         stHash_destruct(ends);
         stList_destruct(adjacencyComponents);
@@ -989,9 +1044,9 @@ static void testStPinchInterval(CuTest *testCase) {
 static void testStPinchThreadSet_getLabelIntervals(CuTest *testCase) {
     setup();
     //Tests when there are no blocks in the problem
-    stHash *pinchEndsToAdjacencyComponents;
-    stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents2(threadSet, &pinchEndsToAdjacencyComponents);
-    stSortedSet *intervals = stPinchThreadSet_getLabelIntervals(threadSet, pinchEndsToAdjacencyComponents);
+    stPinchThreadSet_attachEnds(threadSet);
+    stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+    stSortedSet *intervals = stPinchThreadSet_getLabelIntervals(threadSet);
     CuAssertIntEquals(testCase, 2, stSortedSet_size(intervals));
     stPinchInterval *interval = stPinchIntervals_getInterval(intervals, name1, start1);
     CuAssertTrue(testCase, interval != NULL);
@@ -1005,38 +1060,38 @@ static void testStPinchThreadSet_getLabelIntervals(CuTest *testCase) {
     CuAssertIntEquals(testCase, start2, stPinchInterval_getStart(interval));
     CuAssertIntEquals(testCase, length2, stPinchInterval_getLength(interval));
     CuAssertPtrEquals(testCase, NULL, stPinchInterval_getLabel(interval));
-    stHash_destruct(pinchEndsToAdjacencyComponents);
     stSortedSet_destruct(intervals);
     stList_destruct(adjacencyComponents);
+    stPinchThreadSet_detachEnds(threadSet);
     teardown();
 }
 
-static stList *getAdjacencyComponentP(stPinchSegment *segment, int64_t position, stHash *pinchEndsToAdjacencyComponents) {
+static stList *getAdjacencyComponentP(stPinchSegment *segment, int64_t position) {
     stPinchBlock *block = stPinchSegment_getBlock(segment);
     assert(block != NULL);
     bool orientation = (position >= stPinchSegment_getLength(segment) / 2)
             ^ stPinchSegment_getBlockOrientation(segment);
     stPinchEnd pinchEnd = stPinchEnd_constructStatic(block, orientation);
-    stList *adjacencyComponent = stHash_search(pinchEndsToAdjacencyComponents, &pinchEnd);
+    stList *adjacencyComponent = stPinchEnd_getComponent(&pinchEnd);
     assert(adjacencyComponent != NULL);
     return adjacencyComponent;
 }
 
-static stList *getAdjacencyComponent(stPinchSegment *segment, int64_t position, stHash *pinchEndsToAdjacencyComponents) {
+static stList *getAdjacencyComponent(stPinchSegment *segment, int64_t position) {
     if (stPinchSegment_getBlock(segment) != NULL) {
-        return getAdjacencyComponentP(segment, position, pinchEndsToAdjacencyComponents);
+        return getAdjacencyComponentP(segment, position);
     }
     stPinchSegment *segment2 = stPinchSegment_get3Prime(segment);
     while (segment2 != NULL) {
         if (stPinchSegment_getBlock(segment2) != NULL) {
-            return getAdjacencyComponentP(segment2, -1, pinchEndsToAdjacencyComponents);
+            return getAdjacencyComponentP(segment2, -1);
         }
         segment2 = stPinchSegment_get3Prime(segment2);
     }
     segment2 = stPinchSegment_get5Prime(segment);
     while (segment2 != NULL) {
         if (stPinchSegment_getBlock(segment2) != NULL) {
-            return getAdjacencyComponentP(segment2, INT64_MAX, pinchEndsToAdjacencyComponents);
+            return getAdjacencyComponentP(segment2, INT64_MAX);
         }
         segment2 = stPinchSegment_get5Prime(segment2);
     }
@@ -1048,10 +1103,9 @@ static void testStPinchThreadSet_getLabelIntervals_randomTests(CuTest *testCase)
     for (int64_t test = 0; test < 100; test++) {
         st_logInfo("Starting random get label intervals test %" PRIi64 "\n", test);
         stPinchThreadSet *threadSet = stPinchThreadSet_getRandomGraph();
-        stHash *pinchEndsToAdjacencyComponents;
-        stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents2(threadSet,
-                &pinchEndsToAdjacencyComponents);
-        stSortedSet *intervals = stPinchThreadSet_getLabelIntervals(threadSet, pinchEndsToAdjacencyComponents);
+        stPinchThreadSet_attachEnds(threadSet);
+        stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+        stSortedSet *intervals = stPinchThreadSet_getLabelIntervals(threadSet);
         //Check every base is in a label interval
         stPinchThreadSetSegmentIt segmentIt = stPinchThreadSet_getSegmentIt(threadSet);
         stPinchSegment *segment;
@@ -1067,13 +1121,11 @@ static void testStPinchThreadSet_getLabelIntervals_randomTests(CuTest *testCase)
                         stPinchSegment_getStart(segment) + i < stPinchInterval_getStart(interval)
                                 + stPinchInterval_getLength(interval));
                 //Now check out stupid way of calculating the adjacency component is the same as the calculated by the label function.
-                CuAssertPtrEquals(testCase, getAdjacencyComponent(segment, i, pinchEndsToAdjacencyComponents),
-                        stPinchInterval_getLabel(interval));
+                CuAssertPtrEquals(testCase, getAdjacencyComponent(segment, i), stPinchInterval_getLabel(interval));
             }
         }
         //Cleanup
         stSortedSet_destruct(intervals);
-        stHash_destruct(pinchEndsToAdjacencyComponents);
         stList_destruct(adjacencyComponents);
         stPinchThreadSet_destruct(threadSet);
     }

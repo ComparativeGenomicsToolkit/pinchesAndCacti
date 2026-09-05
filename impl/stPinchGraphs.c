@@ -13,9 +13,18 @@
 #include "sonLib.h"
 #include "stPinchGraphs.h"
 
+/*
+ * The per-end records (see stPinchBlockEnds below) are handed out from chunks of this many
+ * records, so attaching costs one allocation per chunk rather than one per block, and
+ * detaching is one free per chunk.
+ */
+#define ST_PINCH_END_CHUNK_SIZE 4096
+
 struct _stPinchThreadSet {
     stList *threads;
     stHash *threadsHash;
+    stList *endChunks; //arrays of ST_PINCH_END_CHUNK_SIZE stPinchBlockEnds, NULL when ends are not attached
+    int64_t endChunkUsed; //records used in the last chunk
 };
 
 /*
@@ -51,6 +60,8 @@ struct _stPinchThread {
     int64_t indexResizeAt; //resize once the thread has this many segments
     int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
     bool indexStale; //set when a merge frees a segment the index may still point at
+    stPinchSegment *terminatorSegment; //the sentinel after the last segment; never merged away, so its pSegment is always the last segment
+    void *userData; //owned by the caller, NULL until set (caf stores the thread's event here)
 };
 
 /*
@@ -80,13 +91,41 @@ static inline void stPinchSegment_setBlockAndOrientation(stPinchSegment *segment
     segment->blockAndOrientation = (uintptr_t)block | (orientation ? (uintptr_t)1 : (uintptr_t)0);
 }
 
+/*
+ * Per-end scratch attached to a block only while a caller (the cactus graph construction in caf)
+ * needs to look things up by block end. It replaces hashes keyed by heap-allocated stPinchEnds:
+ * the two canonical stPinchEnd objects for the block live here, so an end found by walking the
+ * graph maps to its component or to the caller's data with two loads instead of a hash probe.
+ */
+typedef struct _stPinchBlockEnds {
+    stPinchEnd ends[2]; //ends[o] is the canonical {block, o}; block is set to NULL when the block dies
+    void *component[2]; //the adjacency component (an stList of ends), NULL until the end is visited
+    void *data[2]; //owned by the caller: a cactus node, a chain end, a flower end, ...
+} stPinchBlockEnds;
+
 struct _stPinchBlock {
     uint64_t degree;
     uint64_t numSupportingHomologies : 62;
     uint64_t flags : 2; // From least significant bit to highest: modified flag, filter flag
     stPinchSegment *headSegment;
     stPinchSegment *tailSegment;
+    stPinchBlockEnds *ends; //NULL unless stPinchThreadSet_attachEnds is live and the block existed when it was called
 };
+
+//48 bytes is the jemalloc size class the block lands in; fail the build if it ever creeps past it
+typedef char stPinchBlock_isSmall[(sizeof(struct _stPinchBlock) <= 48) ? 1 : -1];
+
+/*
+ * A block that dies while its record is attached leaves the record behind (the arena owns it);
+ * marking the record lets a stale reference fail loudly rather than read freed memory.
+ */
+static inline void stPinchBlock_killEnds(stPinchBlock *block) {
+    if (block->ends != NULL) {
+        block->ends->ends[0].block = NULL;
+        block->ends->ends[1].block = NULL;
+        block->ends = NULL;
+    }
+}
 
 //Blocks
 
@@ -131,6 +170,7 @@ void stPinchBlock_destruct(stPinchBlock *block) {
         connectBlockToSegment(segment, 0, NULL, NULL);
         segment = nSegment;
     }
+    stPinchBlock_killEnds(block);
     free(block);
 }
 
@@ -162,6 +202,7 @@ stPinchBlock *stPinchBlock_pinch(stPinchBlock *block1, stPinchBlock *block2, boo
         segment = nSegment;
     }
     block1->numSupportingHomologies += block2->numSupportingHomologies + 1;
+    stPinchBlock_killEnds(block2);
     free(block2);
     return block1;
 }
@@ -544,7 +585,18 @@ stPinchSegment *stPinchThread_getFirst(stPinchThread *thread) {
 }
 
 stPinchSegment *stPinchThread_getLast(stPinchThread *thread) {
-    return stPinchThread_getSegment(thread, thread->start + thread->length - 1);
+    //Reading the terminator is O(1); going through the coordinate index would walk the whole
+    //thread whenever the index is stale, which it is after every joinTrivialBoundaries
+    assert(thread->terminatorSegment->pSegment != NULL);
+    return thread->terminatorSegment->pSegment;
+}
+
+void *stPinchThread_getUserData(stPinchThread *thread) {
+    return thread->userData;
+}
+
+void stPinchThread_setUserData(stPinchThread *thread, void *userData) {
+    thread->userData = userData;
 }
 
 void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint) {
@@ -735,6 +787,8 @@ static stPinchThread *stPinchThread_construct(int64_t name, int64_t start, int64
     segment->nSegment = terminatorSegment;
     terminatorSegment->pSegment = segment;
     thread->firstSegment = segment;
+    thread->terminatorSegment = terminatorSegment;
+    thread->userData = NULL;
     return thread;
 }
 
@@ -764,13 +818,118 @@ stPinchThreadSet *stPinchThreadSet_construct() {
     threadSet->threads = stList_construct3(0, (void(*)(void *)) stPinchThread_destruct);
     threadSet->threadsHash = stHash_construct3((uint64_t(*)(const void *)) stPinchThread_hashKey,
             (int(*)(const void *, const void *)) stPinchThread_equals, NULL, NULL);
+    threadSet->endChunks = NULL;
+    threadSet->endChunkUsed = 0;
     return threadSet;
 }
 
 void stPinchThreadSet_destruct(stPinchThreadSet *threadSet) {
+    if (threadSet->endChunks != NULL) {
+        //the blocks go with the threads below, so their record pointers need no clearing
+        stList_destruct(threadSet->endChunks);
+    }
     stList_destruct(threadSet->threads);
     stHash_destruct(threadSet->threadsHash);
     free(threadSet);
+}
+
+//Block end records
+
+bool stPinchThreadSet_endsAttached(stPinchThreadSet *threadSet) {
+    return threadSet->endChunks != NULL;
+}
+
+static stPinchBlockEnds *stPinchThreadSet_allocateEnds(stPinchThreadSet *threadSet) {
+    if (threadSet->endChunkUsed == ST_PINCH_END_CHUNK_SIZE || stList_length(threadSet->endChunks) == 0) {
+        stList_append(threadSet->endChunks, st_malloc(ST_PINCH_END_CHUNK_SIZE * sizeof(stPinchBlockEnds)));
+        threadSet->endChunkUsed = 0;
+    }
+    stPinchBlockEnds *chunk = stList_peek(threadSet->endChunks);
+    return &chunk[threadSet->endChunkUsed++];
+}
+
+void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet) {
+    assert(threadSet->endChunks == NULL);
+    threadSet->endChunks = stList_construct3(0, free);
+    threadSet->endChunkUsed = 0;
+    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlock *block;
+    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+        assert(block->ends == NULL);
+        stPinchBlockEnds *ends = stPinchThreadSet_allocateEnds(threadSet);
+        for (int64_t i = 0; i < 2; i++) {
+            ends->ends[i].block = block;
+            ends->ends[i].orientation = i;
+            ends->component[i] = NULL;
+            ends->data[i] = NULL;
+        }
+        block->ends = ends;
+    }
+}
+
+void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet) {
+    assert(threadSet->endChunks != NULL);
+    //Walk the records rather than the segments: a record whose block is still alive points back at it,
+    //and blocks made since the attach have no record and are already NULL
+    for (int64_t i = 0; i < stList_length(threadSet->endChunks); i++) {
+        stPinchBlockEnds *chunk = stList_get(threadSet->endChunks, i);
+        int64_t used = i + 1 == stList_length(threadSet->endChunks) ? threadSet->endChunkUsed : ST_PINCH_END_CHUNK_SIZE;
+        for (int64_t j = 0; j < used; j++) {
+            if (chunk[j].ends[0].block != NULL) {
+                assert(chunk[j].ends[0].block->ends == &chunk[j]);
+                chunk[j].ends[0].block->ends = NULL;
+            }
+        }
+    }
+    stList_destruct(threadSet->endChunks);
+    threadSet->endChunks = NULL;
+    threadSet->endChunkUsed = 0;
+}
+
+void stPinchThreadSet_clearEndData(stPinchThreadSet *threadSet) {
+    assert(threadSet->endChunks != NULL);
+    for (int64_t i = 0; i < stList_length(threadSet->endChunks); i++) {
+        stPinchBlockEnds *chunk = stList_get(threadSet->endChunks, i);
+        int64_t used = i + 1 == stList_length(threadSet->endChunks) ? threadSet->endChunkUsed : ST_PINCH_END_CHUNK_SIZE;
+        for (int64_t j = 0; j < used; j++) {
+            chunk[j].data[0] = NULL;
+            chunk[j].data[1] = NULL;
+        }
+    }
+}
+
+stPinchEnd *stPinchBlock_getEnd(stPinchBlock *block, bool orientation) {
+    return block->ends == NULL ? NULL : &block->ends->ends[orientation ? 1 : 0];
+}
+
+stPinchEnd *stPinchEnd_getCanonical(const stPinchEnd *end) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    return &end->block->ends->ends[end->orientation ? 1 : 0];
+}
+
+stPinchEnd *stPinchEnd_getOtherEnd(const stPinchEnd *end) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    return &end->block->ends->ends[end->orientation ? 0 : 1];
+}
+
+void *stPinchEnd_getComponent(const stPinchEnd *end) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    return end->block->ends->component[end->orientation ? 1 : 0];
+}
+
+void stPinchEnd_setComponent(const stPinchEnd *end, void *component) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    end->block->ends->component[end->orientation ? 1 : 0] = component;
+}
+
+void *stPinchEnd_getData(const stPinchEnd *end) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    return end->block->ends->data[end->orientation ? 1 : 0];
+}
+
+void stPinchEnd_setData(const stPinchEnd *end, void *data) {
+    assert(end->block != NULL && end->block->ends != NULL);
+    end->block->ends->data[end->orientation ? 1 : 0] = data;
 }
 
 stPinchThread *stPinchThreadSet_addThread(stPinchThreadSet *threadSet, int64_t name, int64_t start, int64_t length) {
@@ -885,10 +1044,15 @@ int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet) {
     return blockCount;
 }
 
-void stPinchThreadSet_getAdjacencyComponentsP2(stHash *endsToAdjacencyComponents, stList *adjacencyComponent, stPinchEnd *end) {
-    stList *stack = stList_construct();
+/*
+ * Depth first search from one canonical end, marking every end reached through an adjacency with
+ * the component. Ends are appended in discovery order, which is what the cactus graph construction
+ * in caf keys its own ordering (and hence the names in its output) on, so this order must not change.
+ */
+static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack) {
+    assert(stList_length(stack) == 0);
     stList_append(adjacencyComponent, end);
-    stHash_insert(endsToAdjacencyComponents, end, adjacencyComponent);
+    stPinchEnd_setComponent(end, adjacencyComponent);
     stList_append(stack, end);
     while (stList_length(stack) > 0) {
         end = stList_pop(stack);
@@ -903,48 +1067,41 @@ void stPinchThreadSet_getAdjacencyComponentsP2(stHash *endsToAdjacencyComponents
                 }
                 stPinchBlock *block = stPinchSegment_getBlock(segment);
                 if (block != NULL) {
-                    stPinchEnd end2 = stPinchEnd_constructStatic(block, stPinchEnd_endOrientation(_5PrimeTraversal, segment));
-                    if (stHash_search(endsToAdjacencyComponents, &end2) == NULL) {
-                        stPinchEnd *end3 = stPinchEnd_construct(end2.block, end2.orientation);
-                        stList_append(adjacencyComponent, end3);
-                        stHash_insert(endsToAdjacencyComponents, end3, adjacencyComponent);
-                        stList_append(stack, end3);
+                    stPinchEnd *end2 = stPinchBlock_getEnd(block, stPinchEnd_endOrientation(_5PrimeTraversal, segment));
+                    assert(end2 != NULL);
+                    if (stPinchEnd_getComponent(end2) == NULL) {
+                        stList_append(adjacencyComponent, end2);
+                        stPinchEnd_setComponent(end2, adjacencyComponent);
+                        stList_append(stack, end2);
                     }
                     break;
                 }
             }
         }
     }
-    stList_destruct(stack);
 }
 
-void stPinchThreadSet_getAdjacencyComponentsP(stHash *endsToAdjacencyComponents, stList *adjacencyComponents, stPinchBlock *block,
-        bool orientation) {
-    stPinchEnd end = stPinchEnd_constructStatic(block, orientation);
-    stList *adjacencyComponent = stHash_search(endsToAdjacencyComponents, &end);
-    if (adjacencyComponent == NULL) {
-        adjacencyComponent = stList_construct3(0, (void(*)(void *)) stPinchEnd_destruct);
+static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack) {
+    stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
+    assert(end != NULL);
+    if (stPinchEnd_getComponent(end) == NULL) {
+        stList *adjacencyComponent = stList_construct(); //the ends belong to the thread set's records
         stList_append(adjacencyComponents, adjacencyComponent);
-        stPinchThreadSet_getAdjacencyComponentsP2(endsToAdjacencyComponents, adjacencyComponent, stPinchEnd_construct(block, orientation));
+        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack);
     }
-}
-
-stList *stPinchThreadSet_getAdjacencyComponents2(stPinchThreadSet *threadSet, stHash **endsToAdjacencyComponents) {
-    *endsToAdjacencyComponents = stHash_construct3(stPinchEnd_hashFn, stPinchEnd_equalsFn, NULL, NULL);
-    stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
-    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
-    stPinchBlock *block;
-    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
-        stPinchThreadSet_getAdjacencyComponentsP(*endsToAdjacencyComponents, adjacencyComponents, block, 0);
-        stPinchThreadSet_getAdjacencyComponentsP(*endsToAdjacencyComponents, adjacencyComponents, block, 1);
-    }
-    return adjacencyComponents;
 }
 
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
-    stHash *endsToAdjacencyComponents;
-    stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents2(threadSet, &endsToAdjacencyComponents);
-    stHash_destruct(endsToAdjacencyComponents);
+    assert(threadSet->endChunks != NULL);
+    stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
+    stList *stack = stList_construct();
+    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlock *block;
+    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack);
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack);
+    }
+    stList_destruct(stack);
     return adjacencyComponents;
 }
 
@@ -1300,7 +1457,7 @@ void stPinchThreadSet_getLabelIntervalsP2(stPinchThread *thread, stSortedSet *pi
     }
 }
 
-void stPinchThreadSet_getLabelIntervalsP(stPinchThread *thread, stHash *pinchEndsToLabels, stSortedSet *pinchIntervals) {
+void stPinchThreadSet_getLabelIntervalsP(stPinchThread *thread, stSortedSet *pinchIntervals) {
     stPinchSegment *segment = stPinchThread_getFirst(thread);
     if (segment == NULL) {
         return;
@@ -1316,20 +1473,15 @@ void stPinchThreadSet_getLabelIntervalsP(stPinchThread *thread, stHash *pinchEnd
                 return;
             }
         }
-        stPinchEnd pinchEnd = stPinchEnd_constructStatic(block, !stPinchSegment_getBlockOrientation(segment));
-        void *label2 = stHash_search(pinchEndsToLabels, &pinchEnd);
+        stPinchEnd *pinchEnd = stPinchBlock_getEnd(block, !stPinchSegment_getBlockOrientation(segment));
+        assert(pinchEnd != NULL);
+        void *label2 = stPinchEnd_getComponent(pinchEnd);
         assert(label2 != NULL);
         if (label == NULL) {
-            pinchEnd.orientation = !pinchEnd.orientation;
-            label = stHash_search(pinchEndsToLabels, &pinchEnd);
+            label = stPinchEnd_getComponent(stPinchEnd_getOtherEnd(pinchEnd));
             assert(label != NULL);
         }
-#ifndef NDEBUG
-        else {
-            pinchEnd.orientation = !pinchEnd.orientation;
-            assert(label == stHash_search(pinchEndsToLabels, &pinchEnd));
-        }
-#endif
+        assert(label == stPinchEnd_getComponent(stPinchEnd_getOtherEnd(pinchEnd)));
         if (label != label2) {
             int64_t end = stPinchSegment_getStart(segment) + stPinchSegment_getLength(segment) / 2;
             if (start < end) {
@@ -1343,13 +1495,14 @@ void stPinchThreadSet_getLabelIntervalsP(stPinchThread *thread, stHash *pinchEnd
     stPinchThreadSet_getLabelIntervalsP2(thread, pinchIntervals, start, label);
 }
 
-stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet, stHash *pinchEndsToLabels) {
+stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet) {
+    assert(threadSet->endChunks != NULL);
     stSortedSet *pinchIntervals = stSortedSet_construct3((int(*)(const void *, const void *)) stPinchInterval_compareFunction,
             (void(*)(void *)) stPinchInterval_destruct);
     stPinchThread *thread;
     stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
     while ((thread = stPinchThreadSetIt_getNext(&threadIt))) {
-        stPinchThreadSet_getLabelIntervalsP(thread, pinchEndsToLabels, pinchIntervals);
+        stPinchThreadSet_getLabelIntervalsP(thread, pinchIntervals);
     }
     return pinchIntervals;
 }

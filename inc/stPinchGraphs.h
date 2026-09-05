@@ -148,19 +148,60 @@ void stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
 int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet);
 
 /*
+ * Block end records. While attached, every block that existed at the time of the attach carries a
+ * record holding its two canonical stPinchEnd objects and, per end, an adjacency component slot and
+ * a caller-owned data slot. Lookups by block end then cost two loads rather than a hash probe on a
+ * heap-allocated end. Blocks created after the attach have no record (stPinchBlock_getEnd returns
+ * NULL for them); a block destroyed while attached leaves its record behind with a NULL block
+ * pointer. The records are freed by the detach, which must happen before the pinch graph is next
+ * modified by pinching or boundary joining.
+ */
+void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet);
+
+void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet);
+
+bool stPinchThreadSet_endsAttached(stPinchThreadSet *threadSet);
+
+/*
+ * Set every record's data slots back to NULL, so a later phase can reuse them.
+ */
+void stPinchThreadSet_clearEndData(stPinchThreadSet *threadSet);
+
+/*
+ * The block's canonical end for the given orientation, or NULL if the block has no record.
+ */
+stPinchEnd *stPinchBlock_getEnd(stPinchBlock *block, bool orientation);
+
+/*
+ * The canonical end equal to the given (possibly static or heap allocated) end, and the canonical
+ * end of the other orientation of the same block. Both require the block to have a record.
+ */
+stPinchEnd *stPinchEnd_getCanonical(const stPinchEnd *end);
+
+stPinchEnd *stPinchEnd_getOtherEnd(const stPinchEnd *end);
+
+/*
+ * The adjacency component slot and the caller data slot of the end's record; the end need not
+ * be the canonical one.
+ */
+void *stPinchEnd_getComponent(const stPinchEnd *end);
+
+void stPinchEnd_setComponent(const stPinchEnd *end, void *component);
+
+void *stPinchEnd_getData(const stPinchEnd *end);
+
+void stPinchEnd_setData(const stPinchEnd *end, void *data);
+
+/*
  * Get a list of adjacency-connected components for this pinch
  * graph. Each connected component is represented by a list of
  * stPinchEnds that are directly or indirectly connected by an
- * adjacency or series of adjacencies.
+ * adjacency or series of adjacencies. Requires the ends to be
+ * attached: the ends in the lists are the canonical ends of the
+ * records, and each end's component slot is set to its list.
+ * The returned list owns the component lists but not the ends.
  */
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet);
-
-/*
- * Same as stPinchThreadSet_getAdjacencyComponents, except you also
- * get a pointer to a hash that maps block ends to adjacency
- * components.
- */
-stList *stPinchThreadSet_getAdjacencyComponents2(stPinchThreadSet *threadSet, stHash **edgeEndsToAdjacencyComponents);
 
 /*
  * Get a list of thread components. Each thread component is a list of
@@ -233,6 +274,13 @@ stPinchSegment *stPinchThread_getFirst(stPinchThread *stPinchThread);
  * Get the 3'-most segment in the thread.
  */
 stPinchSegment *stPinchThread_getLast(stPinchThread *thread);
+
+/*
+ * An arbitrary pointer owned by the caller, NULL until set. Not touched by the pinch graph itself.
+ */
+void *stPinchThread_getUserData(stPinchThread *thread);
+
+void stPinchThread_setUserData(stPinchThread *thread, void *userData);
 
 /*
  * Split the segment at the given thread and position in two, such
@@ -609,10 +657,11 @@ int stPinchInterval_compareFunction(const stPinchInterval *interval1, const stPi
 void stPinchInterval_destruct(stPinchInterval *pinchInterval);
 
 /*
- * Create a set of pinch intervals such that each interval's label
- * corresponds to the closest pinch end.
+ * Create a set of pinch intervals such that each interval's label is
+ * the adjacency component (as set in the end records by
+ * stPinchThreadSet_getAdjacencyComponents) of the closest pinch end.
  */
-stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet, stHash *pinchEndsToLabels);
+stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet);
 
 /*
  * Get the interval corresponding to the given thread and position
