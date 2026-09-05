@@ -25,7 +25,7 @@ typedef struct _stCactusNodeEdgeEndIt {
 typedef struct _stCactusGraph stCactusGraph;
 
 typedef struct _stCactusGraphNodeIterator {
-    stHashIterator *it;
+    stCactusNode *next;
     stCactusGraph *graph;
 } stCactusGraphNodeIt;
 

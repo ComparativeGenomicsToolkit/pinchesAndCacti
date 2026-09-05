@@ -20,4 +20,13 @@
  */
 stList *computeThreeEdgeConnectedComponents(stList *vertices);
 
+/*
+ * The same computation on a graph in compressed sparse row form: vertex v's neighbours are
+ * adj[offsets[v]] .. adj[offsets[v+1]-1], with n vertices numbered from 0. On return *membersOut
+ * holds the n vertices grouped by component and *startsOut the start of each of the *nComponentsOut
+ * components in it (with a sentinel at the end); both are malloc'd and belong to the caller. The
+ * components come out in the same order, and their members in the same order, as the list interface.
+ */
+void computeThreeEdgeConnectedComponentsCSR(int n, const int *offsets, const int *adj, int **membersOut, int **startsOut, int *nComponentsOut);
+
 #endif
