@@ -199,7 +199,9 @@ void stPinchEnd_setData(const stPinchEnd *end, void *data);
  * adjacency or series of adjacencies. Requires the ends to be
  * attached: the ends in the lists are the canonical ends of the
  * records, and each end's component slot is set to its list.
- * The returned list owns the component lists but not the ends.
+ * Only blocks that existed at the attach take part (later ones have
+ * no record). The returned list owns the component lists but not
+ * the ends.
  */
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet);
 

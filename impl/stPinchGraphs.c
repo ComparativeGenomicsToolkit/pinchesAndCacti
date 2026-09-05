@@ -1097,13 +1097,48 @@ static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents
     }
 }
 
+/*
+ * Iteration over the blocks that have a record, in the order the records were made, which is the order
+ * stPinchThreadSet_getBlockIt visited the blocks at the attach. Walking the contiguous records is much
+ * cheaper than the block iterator, which walks every segment of every thread.
+ */
+typedef struct _stPinchBlockEndsIt {
+    stPinchThreadSet *threadSet;
+    int64_t chunk, i;
+} stPinchBlockEndsIt;
+
+static stPinchBlockEndsIt stPinchThreadSet_getBlockEndsIt(stPinchThreadSet *threadSet) {
+    assert(threadSet->endChunks != NULL);
+    stPinchBlockEndsIt it;
+    it.threadSet = threadSet;
+    it.chunk = 0;
+    it.i = 0;
+    return it;
+}
+
+static stPinchBlock *stPinchBlockEndsIt_getNext(stPinchBlockEndsIt *it) {
+    stList *chunks = it->threadSet->endChunks;
+    while (it->chunk < stList_length(chunks)) {
+        int64_t used = it->chunk + 1 == stList_length(chunks) ? it->threadSet->endChunkUsed : ST_PINCH_END_CHUNK_SIZE;
+        while (it->i < used) {
+            stPinchBlockEnds *ends = &((stPinchBlockEnds *) stList_get(chunks, it->chunk))[it->i++];
+            if (ends->ends[0].block != NULL) { //a dead record is one whose block was destroyed after the attach
+                return ends->ends[0].block;
+            }
+        }
+        it->chunk++;
+        it->i = 0;
+    }
+    return NULL;
+}
+
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
     stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
     stList *stack = stList_construct();
-    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlockEndsIt blockIt = stPinchThreadSet_getBlockEndsIt(threadSet);
     stPinchBlock *block;
-    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+    while ((block = stPinchBlockEndsIt_getNext(&blockIt)) != NULL) {
         stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack);
         stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack);
     }
@@ -1127,10 +1162,13 @@ stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
         parent[i] = i;
     }
 
-    //Now join components progressively according to blocks
+    //Now join components progressively according to blocks; the blocks come from the end records when they are
+    //attached (the caller in caf always has them attached here), which spares a walk over every segment
     stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlockEndsIt blockEndsIt = { threadSet, 0, 0 };
+    bool attached = threadSet->endChunks != NULL;
     stPinchBlock *block;
-    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+    while ((block = attached ? stPinchBlockEndsIt_getNext(&blockEndsIt) : stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
         stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
         stPinchSegment *segment = stPinchBlockIt_getNext(&segmentIt);
         assert(segment != NULL);
