@@ -612,28 +612,56 @@ void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint) {
     stPinchSegment_split(segment, leftSideOfSplitPoint);
 }
 
-void stPinchThread_joinTrivialBoundaries(stPinchThread *thread) {
+/*
+ * Absorbs the block-less segments that follow the given block-less segment into it, and returns
+ * the number absorbed.
+ */
+static int64_t stPinchSegment_absorbFollowingBlocklessSegments(stPinchSegment *segment) {
+    assert(stPinchSegment_block(segment) == NULL);
+    int64_t merges = 0;
+    while (1) {
+        stPinchSegment *nSegment = stPinchSegment_get3Prime(segment);
+        if (nSegment != NULL) {
+            stPinchBlock *nBlock = stPinchSegment_getBlock(nSegment);
+            if (nBlock == NULL) {
+                //Trivial join
+                segment->nSegment = nSegment->nSegment;
+                assert(nSegment->nSegment != NULL);
+                nSegment->nSegment->pSegment = segment;
+                stPinchThread_indexInvalidate(segment->thread);
+                stPinchSegment_destruct(nSegment);
+                merges++;
+                continue;
+            }
+        }
+        break;
+    }
+    return merges;
+}
+
+int64_t stPinchThread_joinTrivialBoundaries(stPinchThread *thread) {
+    int64_t merges = 0;
     stPinchSegment *segment = stPinchThread_getFirst(thread);
     do {
         if (stPinchSegment_getBlock(segment) == NULL) {
-            while (1) {
-                stPinchSegment *nSegment = stPinchSegment_get3Prime(segment);
-                if (nSegment != NULL) {
-                    stPinchBlock *nBlock = stPinchSegment_getBlock(nSegment);
-                    if (nBlock == NULL) {
-                        //Trivial join
-                        segment->nSegment = nSegment->nSegment;
-                        assert(nSegment->nSegment != NULL);
-                        nSegment->nSegment->pSegment = segment;
-                        stPinchThread_indexInvalidate(thread);
-                        stPinchSegment_destruct(nSegment);
-                        continue;
-                    }
-                }
-                break;
-            }
+            merges += stPinchSegment_absorbFollowingBlocklessSegments(segment);
         }
     } while ((segment = stPinchSegment_get3Prime(segment)) != NULL);
+    return merges;
+}
+
+stPinchSegment *stPinchSegment_joinTrivialBoundaries(stPinchSegment *segment) {
+    assert(stPinchSegment_block(segment) == NULL);
+    //The run merges into its leftmost segment, as the per-thread pass would leave it
+    while (segment->pSegment != NULL && stPinchSegment_block(segment->pSegment) == NULL) {
+        segment = segment->pSegment;
+    }
+    stPinchSegment_absorbFollowingBlocklessSegments(segment);
+    return segment;
+}
+
+int64_t stPinchThread_getSegmentCount(stPinchThread *thread) {
+    return thread->segmentCount;
 }
 
 stPinchSegment *stPinchThread_pinchP(stPinchSegment *segment1, int64_t start) {
@@ -970,24 +998,34 @@ stPinchThread *stPinchThreadSetIt_getNext(stPinchThreadSetIt *threadIt) {
     return NULL;
 }
 
-void stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet) {
+int64_t stPinchBlock_joinTrivialBoundaries(stPinchBlock *block) {
+    int64_t joins = 0;
+    stPinchEnd end = stPinchEnd_constructStatic(block, 0);
+    if (stPinchEnd_boundaryIsTrivial(end)) {
+        stPinchEnd_joinTrivialBoundary(end);
+        joins++;
+    }
+    end.orientation = 1;
+    if (stPinchEnd_boundaryIsTrivial(end)) {
+        stPinchEnd_joinTrivialBoundary(end);
+        joins++;
+    }
+    return joins;
+}
+
+int64_t stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet) {
+    int64_t changes = 0;
     stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
     stPinchThread *thread;
     while ((thread = stPinchThreadSetIt_getNext(&threadIt)) != NULL) {
-        stPinchThread_joinTrivialBoundaries(thread);
+        changes += stPinchThread_joinTrivialBoundaries(thread);
     }
     stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
     stPinchBlock *block;
     while ((block = stPinchThreadSetBlockIt_getNext(&blockIt))) {
-        stPinchEnd end = stPinchEnd_constructStatic(block, 0);
-        if (stPinchEnd_boundaryIsTrivial(end)) {
-            stPinchEnd_joinTrivialBoundary(end);
-        }
-        end.orientation = 1;
-        if (stPinchEnd_boundaryIsTrivial(end)) {
-            stPinchEnd_joinTrivialBoundary(end);
-        }
+        changes += stPinchBlock_joinTrivialBoundaries(block);
     }
+    return changes;
 }
 
 stPinchSegment *stPinchThreadSet_getSegment(stPinchThreadSet *threadSet, int64_t name, int64_t coordinate) {

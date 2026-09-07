@@ -140,7 +140,20 @@ stPinchThread *stPinchThreadSetIt_getNext(stPinchThreadSetIt *);
  * stPinchThread_joinTrivialBoundaries heals only trivial segment
  * splits.
  */
-void stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
+int64_t stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
+
+/*
+ * The two-end step of stPinchThreadSet_joinTrivialBoundaries for one block: joins whichever of its
+ * boundaries are trivial (the block survives, its neighbour is absorbed). Returns the number joined.
+ */
+int64_t stPinchBlock_joinTrivialBoundaries(stPinchBlock *block);
+
+/*
+ * Given a segment with no block, merges the run of block-less segments it lies in into the run's
+ * first segment, exactly as stPinchThread_joinTrivialBoundaries would, and returns that segment.
+ * The given segment may have been freed on return unless it is the one returned.
+ */
+stPinchSegment *stPinchSegment_joinTrivialBoundaries(stPinchSegment *segment);
 
 /*
  * Get the total number of blocks in the graph.
@@ -304,7 +317,12 @@ void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint);
  * NB: Unlike stPinchThreadSet_joinTrivialBoundaries, this does not
  * heal trivial breaks between blocks.
  */
-void stPinchThread_joinTrivialBoundaries(stPinchThread *thread);
+int64_t stPinchThread_joinTrivialBoundaries(stPinchThread *thread);
+
+/*
+ * The number of segments the thread currently has, not counting the terminator.
+ */
+int64_t stPinchThread_getSegmentCount(stPinchThread *thread);
 
 /*
  * Pinch two threads together (a pairwise gapless alignment). Handles
