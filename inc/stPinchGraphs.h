@@ -647,6 +647,28 @@ int64_t stPinchEnd_getNumberOfConnectedPinchEnds(stPinchEnd *end);
 bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock *otherBlock);
 
 /*
+ * A one-block cache of what the two predicates below read about a block's segments, sorted. They
+ * are asked about the links of a chain in order, and consecutive links share a block, so the far
+ * block of one call is the near block of the next: with a cache each block's segments are read
+ * from memory once per pass rather than twice. The cache is only valid while no block changes;
+ * make one per pass and destruct it after.
+ */
+typedef struct _stPinchSortedSegmentsCache stPinchSortedSegmentsCache;
+
+stPinchSortedSegmentsCache *stPinchSortedSegmentsCache_construct(void);
+
+void stPinchSortedSegmentsCache_destruct(stPinchSortedSegmentsCache *cache);
+
+/*
+ * How many times a block's segments have been read for these predicates, over the process's life.
+ */
+int64_t stPinchSortedSegmentsCache_getBlockReads(void);
+
+bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock2(stPinchEnd *end, stPinchBlock *otherBlock, stPinchSortedSegmentsCache *cache);
+
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds2(stPinchEnd *end, stPinchEnd *otherEnd, stPinchSortedSegmentsCache *cache);
+
+/*
  * Get a list of stIntTuples representing the lengths of the
  * (indirect) adjacencies connecting the two ends.
  */

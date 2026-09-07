@@ -1643,83 +1643,262 @@ int64_t stPinchEnd_getNumberOfConnectedPinchEnds(stPinchEnd *end) {
  * were a measurable part of every build.
  */
 #define SEGMENT_BUFFER_SIZE 64
+//Below this many elements the small arrays sorted by the chain-break predicates use an insertion sort;
+//qsort's overhead dominated at that size. The orders are total, so any sort gives the same result.
+#define SMALL_SORT_SIZE 32
 
-static int stPinchSegment_compareP(const void *a, const void *b) {
-    return stPinchSegment_compare(*(stPinchSegment * const *) a, *(stPinchSegment * const *) b);
+
+/*
+ * What the chain-break predicates read about a segment, copied out once so that neither the scan
+ * below nor a later call served from the cache has to touch the segment again.
+ */
+typedef struct _stPinchSegmentKey {
+    stPinchThread *thread;
+    stPinchBlock *block;
+    int64_t start;
+    bool orientation; //the segment's block orientation
+} stPinchSegmentKey;
+
+/*
+ * A run of sorted keys with room to grow.
+ */
+typedef struct _stPinchKeyRun {
+    stPinchBlock *block; //whose keys these are, or NULL
+    stPinchSegmentKey *keys;
+    int64_t n, capacity;
+    bool heap; //keys is from malloc (else a caller's stack buffer, replaced by a heap one when it must grow)
+} stPinchKeyRun;
+
+/*
+ * The chain-break passes ask about every link from both sides and walk the links in order, so the
+ * pair asked about is either the previous pair reversed or shares a block with it. The cache keeps
+ * the sorted runs of the two blocks of the last pair and their merge.
+ */
+struct _stPinchSortedSegmentsCache {
+    stPinchKeyRun runs[2];
+    stPinchKeyRun merged; //of runs[0] and runs[1]; merged.block is runs[0].block and mergedWith runs[1].block
+    stPinchBlock *mergedWith;
+};
+
+static void stPinchKeyRun_init(stPinchKeyRun *run) {
+    run->block = NULL;
+    run->capacity = SEGMENT_BUFFER_SIZE;
+    run->keys = st_malloc(run->capacity * sizeof(stPinchSegmentKey));
+    run->n = 0;
+    run->heap = 1;
+}
+
+static void stPinchKeyRun_reserve(stPinchKeyRun *run, int64_t n) {
+    if (n > run->capacity) {
+        run->capacity = 2 * n;
+        if (run->heap) {
+            run->keys = st_realloc(run->keys, run->capacity * sizeof(stPinchSegmentKey));
+        } else { //a stack buffer: the keys it holds are not needed past a reserve, which precedes a fill or merge
+            run->keys = st_malloc(run->capacity * sizeof(stPinchSegmentKey));
+            run->heap = 1;
+        }
+    }
+}
+
+stPinchSortedSegmentsCache *stPinchSortedSegmentsCache_construct(void) {
+    stPinchSortedSegmentsCache *cache = st_malloc(sizeof(stPinchSortedSegmentsCache));
+    stPinchKeyRun_init(&cache->runs[0]);
+    stPinchKeyRun_init(&cache->runs[1]);
+    stPinchKeyRun_init(&cache->merged);
+    cache->mergedWith = NULL;
+    return cache;
+}
+
+void stPinchSortedSegmentsCache_destruct(stPinchSortedSegmentsCache *cache) {
+    free(cache->runs[0].keys);
+    free(cache->runs[1].keys);
+    free(cache->merged.keys);
+    free(cache);
+}
+
+static inline int stPinchSegmentKey_compare(const stPinchSegmentKey *a, const stPinchSegmentKey *b) {
+    //the order of stPinchSegment_compare: thread name, then start
+    if (a->thread->name != b->thread->name) {
+        return a->thread->name > b->thread->name ? 1 : -1;
+    }
+    return a->start < b->start ? -1 : (a->start > b->start ? 1 : 0);
+}
+
+static int stPinchSegmentKey_compareP(const void *a, const void *b) {
+    return stPinchSegmentKey_compare(a, b);
 }
 
 /*
- * The arrays sorted here hold the segments of one or two blocks, or the lengths between two block ends,
- * so they are almost always a handful of elements; qsort's overhead dominated the sort at that size.
- * The orders are total (segments are distinct in thread and coordinate) so any sort gives the same
- * result as the qsort it replaces.
+ * The keys of a block's segments, sorted, into the run. The order is total (no two distinct segments
+ * share a thread and start), so any sort gives the same order.
  */
-#define SMALL_SORT_SIZE 32
+static int64_t stPinchKeyRun_fills = 0; //blocks whose segments were read, for the caf timing log
 
-static void sortSegments(stPinchSegment **segments, int64_t n) {
+int64_t stPinchSortedSegmentsCache_getBlockReads(void) {
+    return stPinchKeyRun_fills;
+}
+
+static void stPinchKeyRun_fill(stPinchKeyRun *run, stPinchBlock *block) {
+    int64_t n = 0;
+    stPinchKeyRun_fills++;
+    stPinchKeyRun_reserve(run, stPinchBlock_getDegree(block));
+    stPinchSegmentKey *keys = run->keys;
+    stPinchBlockIt it = stPinchBlock_getSegmentIterator(block);
+    stPinchSegment *segment;
+    while ((segment = stPinchBlockIt_getNext(&it)) != NULL) {
+        keys[n].thread = segment->thread;
+        keys[n].block = block;
+        keys[n].start = segment->start;
+        keys[n].orientation = stPinchSegment_orientation(segment);
+        n++;
+    }
+    assert(n == stPinchBlock_getDegree(block));
+    run->block = block;
+    run->n = n;
     if (n > SMALL_SORT_SIZE) {
-        qsort(segments, n, sizeof(stPinchSegment *), stPinchSegment_compareP);
+        qsort(keys, n, sizeof(stPinchSegmentKey), stPinchSegmentKey_compareP);
         return;
     }
     for (int64_t i = 1; i < n; i++) {
-        stPinchSegment *segment = segments[i];
+        stPinchSegmentKey key = keys[i];
         int64_t j = i;
-        while (j > 0 && stPinchSegment_compare(segments[j - 1], segment) > 0) {
-            segments[j] = segments[j - 1];
+        while (j > 0 && stPinchSegmentKey_compare(&keys[j - 1], &key) > 0) {
+            keys[j] = keys[j - 1];
             j--;
         }
-        segments[j] = segment;
+        keys[j] = key;
     }
 }
 
-static stPinchSegment **getSortedBlockSegments(stPinchBlock *block1, stPinchBlock *block2, stPinchSegment **buffer, int64_t *n) {
-    *n = stPinchBlock_getDegree(block1) + (block2 != block1 ? stPinchBlock_getDegree(block2) : 0);
-    stPinchSegment **segments = *n <= SEGMENT_BUFFER_SIZE ? buffer : st_malloc(*n * sizeof(stPinchSegment *));
-    int64_t i = 0;
-    stPinchBlockIt it = stPinchBlock_getSegmentIterator(block1);
-    stPinchSegment *segment;
-    while ((segment = stPinchBlockIt_getNext(&it)) != NULL) {
-        segments[i++] = segment;
+static void stPinchKeyRun_merge(stPinchKeyRun *merged, const stPinchKeyRun *a, const stPinchKeyRun *b) {
+    stPinchKeyRun_reserve(merged, a->n + b->n);
+    int64_t i = 0, j = 0, k = 0;
+    while (i < a->n && j < b->n) {
+        merged->keys[k++] = stPinchSegmentKey_compare(&a->keys[i], &b->keys[j]) <= 0 ? a->keys[i++] : b->keys[j++];
     }
-    if (block2 != block1) {
-        it = stPinchBlock_getSegmentIterator(block2);
-        while ((segment = stPinchBlockIt_getNext(&it)) != NULL) {
-            segments[i++] = segment;
+    while (i < a->n) {
+        merged->keys[k++] = a->keys[i++];
+    }
+    while (j < b->n) {
+        merged->keys[k++] = b->keys[j++];
+    }
+    merged->n = k;
+}
+
+/*
+ * The keys of the segments of one or two blocks, sorted by thread and then coordinate, which is the
+ * same order as sorting the union of the two sorted runs. The result lives in the cache (or in the
+ * caller's stack run when there is no cache) until the next call.
+ */
+static const stPinchKeyRun *getSortedBlockSegmentKeys(stPinchBlock *block1, stPinchBlock *block2, stPinchSortedSegmentsCache *cache, stPinchSortedSegmentsCache *stackCache) {
+    if (cache == NULL) {
+        cache = stackCache;
+        cache->runs[0].block = cache->runs[1].block = cache->merged.block = NULL;
+        cache->mergedWith = NULL;
+    }
+    if (block2 == block1) {
+        if (cache->runs[0].block == block1) {
+            return &cache->runs[0];
+        }
+        if (cache->runs[1].block == block1) {
+            return &cache->runs[1];
+        }
+        stPinchKeyRun_fill(&cache->runs[0], block1);
+        cache->merged.block = NULL;
+        return &cache->runs[0];
+    }
+    //the same pair, in either order, has the same merge
+    if (cache->merged.block != NULL && ((cache->merged.block == block1 && cache->mergedWith == block2) || (cache->merged.block == block2 && cache->mergedWith == block1))) {
+        return &cache->merged;
+    }
+    //keep whichever runs the pair reuses; fill the others
+    stPinchKeyRun *run1 = NULL, *run2 = NULL;
+    for (int64_t i = 0; i < 2; i++) {
+        if (cache->runs[i].block == block1) {
+            run1 = &cache->runs[i];
+        } else if (cache->runs[i].block == block2) {
+            run2 = &cache->runs[i];
         }
     }
-    assert(i == *n);
-    //The comparison is a total order (no two distinct segments share a thread and start), so any sort gives the same order
-    sortSegments(segments, *n);
-    return segments;
+    if (run1 == NULL) {
+        run1 = run2 == &cache->runs[0] ? &cache->runs[1] : &cache->runs[0];
+        stPinchKeyRun_fill(run1, block1);
+    }
+    if (run2 == NULL) {
+        run2 = run1 == &cache->runs[0] ? &cache->runs[1] : &cache->runs[0];
+        stPinchKeyRun_fill(run2, block2);
+    }
+    assert(run1 != run2 && run1->block == block1 && run2->block == block2);
+    stPinchKeyRun_merge(&cache->merged, run1, run2);
+    cache->merged.block = block1;
+    cache->mergedWith = block2;
+    return &cache->merged;
 }
 
-bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock *otherBlock) {
+static inline bool stPinchSegmentKey_traverse5Prime(bool endOrientation, const stPinchSegmentKey *key) {
+    return !(key->orientation ^ endOrientation); //stPinchEnd_traverse5Prime on the key
+}
+
+/*
+ * A cache on the stack for a call made without one: its runs are freed on return.
+ */
+static void stackCache_init(stPinchSortedSegmentsCache *cache, stPinchSegmentKey *keys1, stPinchSegmentKey *keys2, stPinchSegmentKey *merged) {
+    cache->runs[0].keys = keys1;
+    cache->runs[1].keys = keys2;
+    cache->merged.keys = merged;
+    cache->runs[0].capacity = cache->runs[1].capacity = cache->merged.capacity = SEGMENT_BUFFER_SIZE;
+    cache->runs[0].n = cache->runs[1].n = cache->merged.n = 0;
+    cache->runs[0].heap = cache->runs[1].heap = cache->merged.heap = 0;
+}
+
+static void stackCache_free(stPinchSortedSegmentsCache *cache, stPinchSegmentKey *keys1, stPinchSegmentKey *keys2, stPinchSegmentKey *merged) {
+    if (cache->runs[0].heap) {
+        free(cache->runs[0].keys);
+    }
+    if (cache->runs[1].heap) {
+        free(cache->runs[1].keys);
+    }
+    if (cache->merged.heap) {
+        free(cache->merged.keys);
+    }
+}
+
+bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock2(stPinchEnd *end, stPinchBlock *otherBlock, stPinchSortedSegmentsCache *cache) {
     //Segments in end and otherEnd's blocks, sorted by thread and then coordinate.
-    stPinchSegment *buffer[SEGMENT_BUFFER_SIZE];
-    int64_t n;
-    stPinchSegment **l = getSortedBlockSegments(stPinchEnd_getBlock(end), otherBlock, buffer, &n);
+    stPinchSegmentKey keys1[SEGMENT_BUFFER_SIZE], keys2[SEGMENT_BUFFER_SIZE], mergedKeys[SEGMENT_BUFFER_SIZE];
+    stPinchSortedSegmentsCache stackCache;
+    stackCache_init(&stackCache, keys1, keys2, mergedKeys);
+    stPinchBlock *block = stPinchEnd_getBlock(end);
+    bool endOrientation = stPinchEnd_getOrientation(end);
+    const stPinchKeyRun *run = getSortedBlockSegmentKeys(block, otherBlock, cache, &stackCache);
+    const stPinchSegmentKey *l = run->keys;
+    int64_t n = run->n;
     bool selfLoop = 0;
 
     //Walk through list of segments
     for(int64_t i=1; i<n; i++) {
-        stPinchSegment *s1 = l[i-1];
-        stPinchSegment *s2 = l[i];
+        const stPinchSegmentKey *s1 = &l[i-1];
+        const stPinchSegmentKey *s2 = &l[i];
         //If there exists two successive segments in the same thread from block's end that are joined by an interstitial sequence,
         //without an intervening segment from otherEnd's block then we have identified a self-loop.
-        if(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(end) && //same block
-           stPinchSegment_getBlock(s2) == stPinchEnd_getBlock(end) && //same block
-           stPinchSegment_getThread(s1) == stPinchSegment_getThread(s2) && //same thread
-           !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s1) && //contiguous
-           stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2) /*contiguous*/) {
-            assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
+        if(s1->block == block && //same block
+           s2->block == block && //same block
+           s1->thread == s2->thread && //same thread
+           !stPinchSegmentKey_traverse5Prime(endOrientation, s1) && //contiguous
+           stPinchSegmentKey_traverse5Prime(endOrientation, s2) /*contiguous*/) {
+            assert(s1->start + block->length <= s2->start);
             selfLoop = 1;
             break;
         }
     }
-    if (l != buffer) {
-        free(l);
+    if (cache == NULL) {
+        stackCache_free(&stackCache, keys1, keys2, mergedKeys);
     }
     return selfLoop;
+}
+
+bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock *otherBlock) {
+    return stPinchEnd_hasSelfLoopWithRespectToOtherBlock2(end, otherBlock, NULL);
 }
 
 /*
@@ -1727,42 +1906,48 @@ bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock
  * connecting subsequence, in the same order the list version appended them.
  */
 static void stPinchEnd_forEachSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd,
-        void (*lengthFn)(int64_t, void *), void *extraArg) {
-    stPinchSegment *buffer[SEGMENT_BUFFER_SIZE];
-    int64_t n;
-    stPinchSegment **l = getSortedBlockSegments(stPinchEnd_getBlock(end), stPinchEnd_getBlock(otherEnd), buffer, &n);
+        void (*lengthFn)(int64_t, void *), void *extraArg, stPinchSortedSegmentsCache *cache) {
+    stPinchSegmentKey keys1[SEGMENT_BUFFER_SIZE], keys2[SEGMENT_BUFFER_SIZE], mergedKeys[SEGMENT_BUFFER_SIZE];
+    stPinchSortedSegmentsCache stackCache;
+    stackCache_init(&stackCache, keys1, keys2, mergedKeys);
+    stPinchBlock *block = stPinchEnd_getBlock(end), *otherBlock = stPinchEnd_getBlock(otherEnd);
+    bool endOrientation = stPinchEnd_getOrientation(end), otherEndOrientation = stPinchEnd_getOrientation(otherEnd);
+    bool sameBlockOtherEnd = block == otherBlock && !stPinchEnd_equalsFn(end, otherEnd);
+    const stPinchKeyRun *run = getSortedBlockSegmentKeys(block, otherBlock, cache, &stackCache);
+    const stPinchSegmentKey *l = run->keys;
+    int64_t n = run->n;
 
     //Walk through list of segments
     for(int64_t i=1; i<n; i++) {
-        stPinchSegment *s1 = l[i-1];
-        stPinchSegment *s2 = l[i];
+        const stPinchSegmentKey *s1 = &l[i-1];
+        const stPinchSegmentKey *s2 = &l[i];
         //If there exists two successive segments in different ends that are contigous add their length.
-        if(stPinchSegment_getThread(s1) == stPinchSegment_getThread(s2)) { //same thread
-            if(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(end)) { //case where first segment is from first block.
-               if(stPinchSegment_getBlock(s2) == stPinchEnd_getBlock(otherEnd) && //right blocks
-                   ((!stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s1) && //contiguity, traverse 5 to 3 from end to otherEnd
-                   stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(otherEnd), s2)) ||
+        if(s1->thread == s2->thread) { //same thread
+            if(s1->block == block) { //case where first segment is from first block.
+               if(s2->block == otherBlock && //right blocks
+                   ((!stPinchSegmentKey_traverse5Prime(endOrientation, s1) && //contiguity, traverse 5 to 3 from end to otherEnd
+                   stPinchSegmentKey_traverse5Prime(otherEndOrientation, s2)) ||
                    //second case of contiguity occurs when ends are opposite ends of same block, in which case we must consider
                    //traverse 5 to 4 from otherEnd to end
-                   (stPinchEnd_getBlock(end) == stPinchEnd_getBlock(otherEnd) && !stPinchEnd_equalsFn(end, otherEnd) &&
-                   !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(otherEnd), s1) &&
-                   stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2)))) {
-                   assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
-                   lengthFn(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1)), extraArg);
+                   (sameBlockOtherEnd &&
+                   !stPinchSegmentKey_traverse5Prime(otherEndOrientation, s1) &&
+                   stPinchSegmentKey_traverse5Prime(endOrientation, s2)))) {
+                   assert(s1->start + s1->block->length <= s2->start);
+                   lengthFn(s2->start - (s1->start + s1->block->length), extraArg);
                }
             } else {
-                assert(stPinchSegment_getBlock(s1) == stPinchEnd_getBlock(otherEnd)); //case where first segment is from other block.
-                if(stPinchSegment_getBlock(s2) == stPinchEnd_getBlock(end) && //different blocks
-                     !stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(otherEnd), s1) &&
-                     stPinchEnd_traverse5Prime(stPinchEnd_getOrientation(end), s2)) { //contiguous
-                    assert(stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1) <= s2->start);
-                    lengthFn(stPinchSegment_getStart(s2) - (stPinchSegment_getStart(s1) + stPinchSegment_getLength(s1)), extraArg);
+                assert(s1->block == otherBlock); //case where first segment is from other block.
+                if(s2->block == block && //different blocks
+                     !stPinchSegmentKey_traverse5Prime(otherEndOrientation, s1) &&
+                     stPinchSegmentKey_traverse5Prime(endOrientation, s2)) { //contiguous
+                    assert(s1->start + s1->block->length <= s2->start);
+                    lengthFn(s2->start - (s1->start + s1->block->length), extraArg);
                 }
             }
         }
     }
-    if (l != buffer) {
-        free(l);
+    if (cache == NULL) {
+        stackCache_free(&stackCache, keys1, keys2, mergedKeys);
     }
 }
 
@@ -1811,12 +1996,12 @@ static void sortInt64s(int64_t *values, int64_t n) {
     }
 }
 
-int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds2(stPinchEnd *end, stPinchEnd *otherEnd, stPinchSortedSegmentsCache *cache) {
     LengthBuffer b;
     b.lengths = b.buffer;
     b.n = 0;
     b.capacity = SEGMENT_BUFFER_SIZE;
-    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthToBuffer, &b);
+    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthToBuffer, &b, cache);
     int64_t median = -1;
     if (b.n > 0) {
         sortInt64s(b.lengths, b.n); //ascending, like stIntTuple_cmpFn on the list version
@@ -1828,10 +2013,14 @@ int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stP
     return median;
 }
 
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
+    return stPinchEnd_getMedianSubSequenceLengthConnectingEnds2(end, otherEnd, NULL);
+}
+
 stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
     //List of lengths to return, in the order found.
     stList *lengths = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
-    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthAsIntTuple, lengths);
+    stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthAsIntTuple, lengths, NULL);
     return lengths;
 }
 
