@@ -226,6 +226,35 @@ void stPinchEnd_setData(const stPinchEnd *end, void *data);
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet);
 
 /*
+ * The adjacency components as one shared array of ends and an arena of component headers, which is
+ * what a cactus graph build wants: no list per component to make, grow and free. The thread set owns
+ * the structure; it is freed by the next call, by a detach or remake of the end records, or by the
+ * set's destruct. Each end's component slot holds its stPinchComponent. The components come in
+ * discovery order and each component's ends in discovery order, exactly as the list form above.
+ */
+typedef struct _stPinchComponent stPinchComponent;
+struct _stPinchComponent {
+    stPinchEnd **ends;
+    int32_t length;
+    int32_t capacity; //-1 for a component whose ends are a view into the shared array; otherwise the array is its own and can grow
+    stPinchComponent *next, *tail; //free for the caller to string components together
+};
+typedef struct _stPinchAdjacencyComponents stPinchAdjacencyComponents;
+
+stPinchAdjacencyComponents *stPinchThreadSet_getFlatAdjacencyComponents(stPinchThreadSet *threadSet);
+
+int64_t stPinchAdjacencyComponents_getNumber(stPinchAdjacencyComponents *components);
+
+stPinchComponent *stPinchAdjacencyComponents_get(stPinchAdjacencyComponents *components, int64_t i);
+
+/*
+ * Adds an empty component with its own growable array of ends after the existing ones.
+ */
+stPinchComponent *stPinchAdjacencyComponents_addComponent(stPinchAdjacencyComponents *components);
+
+void stPinchComponent_append(stPinchComponent *component, stPinchEnd *end);
+
+/*
  * Get a list of thread components. Each thread component is a list of
  * stPinchThreads that transitively share at least one block (although
  * any two given threads in the component don't necessarily have to

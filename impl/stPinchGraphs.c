@@ -33,7 +33,85 @@ struct _stPinchThreadSet {
     bool threadComponentsValid; //the parent array describes the current graph; cleared when a block changes
     uint16_t adjacencyEpoch; //stamped on the block ends the adjacency component search reaches, so that
                              //it needs no pass to clear the marks of the previous search
+    stPinchAdjacencyComponents *adjacencyComponents; //the last flat components made, or NULL
 };
+
+#define ST_PINCH_COMPONENT_CHUNK_SIZE 65536
+
+struct _stPinchAdjacencyComponents {
+    stPinchEnd **ends; //every end of a view component, grouped by component
+    int64_t numEnds, endsCapacity;
+    stList *chunks; //arrays of ST_PINCH_COMPONENT_CHUNK_SIZE stPinchComponent
+    int64_t numComponents;
+};
+
+static stPinchAdjacencyComponents *stPinchAdjacencyComponents_construct(int64_t endsCapacity) {
+    stPinchAdjacencyComponents *components = st_malloc(sizeof(stPinchAdjacencyComponents));
+    components->ends = st_malloc((endsCapacity > 0 ? endsCapacity : 1) * sizeof(stPinchEnd *));
+    components->numEnds = 0;
+    components->endsCapacity = endsCapacity;
+    components->chunks = stList_construct3(0, free);
+    components->numComponents = 0;
+    return components;
+}
+
+static void stPinchAdjacencyComponents_destruct(stPinchAdjacencyComponents *components) {
+    for (int64_t i = 0; i < components->numComponents; i++) {
+        stPinchComponent *component = stPinchAdjacencyComponents_get(components, i);
+        if (component->capacity >= 0) {
+            free(component->ends);
+        }
+    }
+    stList_destruct(components->chunks);
+    free(components->ends);
+    free(components);
+}
+
+int64_t stPinchAdjacencyComponents_getNumber(stPinchAdjacencyComponents *components) {
+    return components->numComponents;
+}
+
+stPinchComponent *stPinchAdjacencyComponents_get(stPinchAdjacencyComponents *components, int64_t i) {
+    assert(i >= 0 && i < components->numComponents);
+    return &((stPinchComponent *) stList_get(components->chunks, i / ST_PINCH_COMPONENT_CHUNK_SIZE))[i % ST_PINCH_COMPONENT_CHUNK_SIZE];
+}
+
+static stPinchComponent *stPinchAdjacencyComponents_newComponent(stPinchAdjacencyComponents *components) {
+    if (components->numComponents % ST_PINCH_COMPONENT_CHUNK_SIZE == 0) {
+        stList_append(components->chunks, st_malloc(ST_PINCH_COMPONENT_CHUNK_SIZE * sizeof(stPinchComponent)));
+    }
+    stPinchComponent *component = stPinchAdjacencyComponents_get(components, components->numComponents++);
+    component->length = 0;
+    component->next = NULL;
+    component->tail = NULL;
+    return component;
+}
+
+stPinchComponent *stPinchAdjacencyComponents_addComponent(stPinchAdjacencyComponents *components) {
+    stPinchComponent *component = stPinchAdjacencyComponents_newComponent(components);
+    component->capacity = 16;
+    component->ends = st_malloc(component->capacity * sizeof(stPinchEnd *));
+    return component;
+}
+
+void stPinchComponent_append(stPinchComponent *component, stPinchEnd *end) {
+    assert(component->capacity >= 0); //a view into the shared array cannot grow
+    if (component->length == component->capacity) {
+        component->capacity *= 2;
+        component->ends = st_realloc(component->ends, component->capacity * sizeof(stPinchEnd *));
+    }
+    component->ends[component->length++] = end;
+}
+
+/*
+ * Forget the flat components: called whenever the records they point into are about to go.
+ */
+static void stPinchThreadSet_forgetAdjacencyComponents(stPinchThreadSet *threadSet) {
+    if (threadSet->adjacencyComponents != NULL) {
+        stPinchAdjacencyComponents_destruct(threadSet->adjacencyComponents);
+        threadSet->adjacencyComponents = NULL;
+    }
+}
 
 /*
  * Segments of a thread are kept in a doubly-linked list ordered by start coordinate.
@@ -940,10 +1018,12 @@ stPinchThreadSet *stPinchThreadSet_construct() {
     threadSet->threadComponentParentLength = 0;
     threadSet->threadComponentsValid = 0;
     threadSet->adjacencyEpoch = 0;
+    threadSet->adjacencyComponents = NULL;
     return threadSet;
 }
 
 void stPinchThreadSet_destruct(stPinchThreadSet *threadSet) {
+    stPinchThreadSet_forgetAdjacencyComponents(threadSet);
     if (threadSet->endChunks != NULL) {
         //the blocks go with the threads below, so their record pointers need no clearing
         stList_destruct(threadSet->endChunks);
@@ -970,6 +1050,7 @@ static stPinchBlockEnds *stPinchThreadSet_allocateEnds(stPinchThreadSet *threadS
 }
 
 void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet) {
+    stPinchThreadSet_forgetAdjacencyComponents(threadSet); //they hold the previous search's components
     if (threadSet->endChunks != NULL) {
         if (threadSet->attachedEpoch == threadSet->blockEpoch) {
             //No block has been made and no block's first segment has moved since the records were made, and
@@ -1010,6 +1091,7 @@ void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet) {
 
 void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
+    stPinchThreadSet_forgetAdjacencyComponents(threadSet);
     //Walk the records rather than the segments: a record whose block is still alive points back at it,
     //and blocks made since the attach have no record and are already NULL
     for (int64_t i = 0; i < stList_length(threadSet->endChunks); i++) {
@@ -1250,11 +1332,18 @@ static int64_t *stPinchThreadSet_resetThreadComponentParent(stPinchThreadSet *th
  * The search reads every segment of every block anyway, so it also joins the threads of each block
  * in the union-find, which spares stPinchThreadSet_getThreadComponents a second pass over them.
  */
-static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
+static inline void stPinchAdjacencyComponents_appendEnd(stPinchAdjacencyComponents *components, stPinchComponent *component, stPinchEnd *end) {
+    assert(components->numEnds < components->endsCapacity);
+    assert(component->ends + component->length == components->ends + components->numEnds); //the component being built is the last
+    components->ends[components->numEnds++] = end;
+    component->length++;
+}
+
+static void stPinchThreadSet_getAdjacencyComponentsP2(stPinchAdjacencyComponents *components, stPinchComponent *adjacencyComponent, stPinchEnd *end, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
     assert(stList_length(stack) == 0);
     assert(end->block->visited[end->orientation] != epoch);
     end->block->visited[end->orientation] = epoch;
-    stList_append(adjacencyComponent, end);
+    stPinchAdjacencyComponents_appendEnd(components, adjacencyComponent, end);
     stPinchEnd_setComponent(end, adjacencyComponent);
     stList_append(stack, end);
     while (stList_length(stack) > 0) {
@@ -1286,7 +1375,7 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
                         block->visited[orientation2] = epoch;
                         stPinchEnd *end2 = stPinchBlock_getEnd(block, orientation2);
                         assert(end2 != NULL && stPinchEnd_getComponent(end2) == NULL);
-                        stList_append(adjacencyComponent, end2);
+                        stPinchAdjacencyComponents_appendEnd(components, adjacencyComponent, end2);
                         stPinchEnd_setComponent(end2, adjacencyComponent);
                         stList_append(stack, end2);
                     }
@@ -1297,15 +1386,14 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
     }
 }
 
-static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
+static void stPinchThreadSet_getAdjacencyComponentsP(stPinchAdjacencyComponents *components, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
     if (block->visited[orientation] != epoch) {
         stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
         assert(end != NULL && stPinchEnd_getComponent(end) == NULL);
-        //the ends belong to the thread set's records; most components are one adjacency between two ends, so
-        //room for a few spares the growth of an empty list on the first appends
-        stList *adjacencyComponent = stList_constructWithCapacity(4, NULL);
-        stList_append(adjacencyComponents, adjacencyComponent);
-        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack, threadComponentParent, epoch);
+        stPinchComponent *adjacencyComponent = stPinchAdjacencyComponents_newComponent(components);
+        adjacencyComponent->ends = components->ends + components->numEnds; //a view into the shared array
+        adjacencyComponent->capacity = -1;
+        stPinchThreadSet_getAdjacencyComponentsP2(components, adjacencyComponent, end, stack, threadComponentParent, epoch);
     }
 }
 
@@ -1339,9 +1427,17 @@ stPinchBlock *stPinchThreadSetAttachedBlockIt_getNext(stPinchThreadSetAttachedBl
     return NULL;
 }
 
-stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
+stPinchAdjacencyComponents *stPinchThreadSet_getFlatAdjacencyComponents(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
-    stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
+    stPinchThreadSet_forgetAdjacencyComponents(threadSet);
+    //Every live record contributes two ends, so the shared array can be sized exactly up front
+    int64_t liveBlocks = 0;
+    stPinchThreadSetAttachedBlockIt countIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
+    while (stPinchThreadSetAttachedBlockIt_getNext(&countIt) != NULL) {
+        liveBlocks++;
+    }
+    stPinchAdjacencyComponents *adjacencyComponents = stPinchAdjacencyComponents_construct(2 * liveBlocks);
+    threadSet->adjacencyComponents = adjacencyComponents;
     stList *stack = stList_construct();
     int64_t *threadComponentParent = stPinchThreadSet_resetThreadComponentParent(threadSet);
     //A new epoch makes every block end unvisited without a pass over the blocks; when the counter
@@ -1363,6 +1459,25 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     }
     stList_destruct(stack);
     threadSet->threadComponentsValid = 1;
+    assert(adjacencyComponents->numEnds == 2 * liveBlocks);
+    return adjacencyComponents;
+}
+
+stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
+    //The list form, built from the flat one: a list per component, in the same order, with each end's
+    //component slot pointing at its list. The flat form is dropped, since the slots no longer refer to it.
+    stPinchAdjacencyComponents *flat = stPinchThreadSet_getFlatAdjacencyComponents(threadSet);
+    stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
+    for (int64_t i = 0; i < flat->numComponents; i++) {
+        stPinchComponent *component = stPinchAdjacencyComponents_get(flat, i);
+        stList *adjacencyComponent = stList_constructWithCapacity(component->length > 0 ? component->length : 1, NULL);
+        for (int64_t j = 0; j < component->length; j++) {
+            stList_append(adjacencyComponent, component->ends[j]);
+            stPinchEnd_setComponent(component->ends[j], adjacencyComponent);
+        }
+        stList_append(adjacencyComponents, adjacencyComponent);
+    }
+    stPinchThreadSet_forgetAdjacencyComponents(threadSet);
     return adjacencyComponents;
 }
 

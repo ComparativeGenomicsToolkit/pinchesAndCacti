@@ -1019,6 +1019,57 @@ static void testStPinchThreadSet_getThreadComponents_cached(CuTest *testCase) {
     }
 }
 
+/*
+ * The flat components hold the same ends in the same order as the list form, each end's slot names its
+ * component, and a component added by the caller can grow.
+ */
+static void testStPinchThreadSet_getFlatAdjacencyComponents(CuTest *testCase) {
+    for (int64_t test = 0; test < 100; test++) {
+        stPinchThreadSet *threadSet = stPinchThreadSet_getRandomGraph();
+        stPinchThreadSet_attachEnds(threadSet);
+        stPinchAdjacencyComponents *flat = stPinchThreadSet_getFlatAdjacencyComponents(threadSet);
+        //Record what the flat form holds, then get the list form, which replaces it
+        int64_t n = stPinchAdjacencyComponents_getNumber(flat);
+        stList *signature = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+        for (int64_t i = 0; i < n; i++) {
+            stPinchComponent *component = stPinchAdjacencyComponents_get(flat, i);
+            CuAssertTrue(testCase, component->capacity == -1);
+            for (int64_t j = 0; j < component->length; j++) {
+                CuAssertPtrEquals(testCase, component, stPinchEnd_getComponent(component->ends[j]));
+                stList_append(signature, stIntTuple_construct3(i, (int64_t) (intptr_t) stPinchEnd_getBlock(component->ends[j]), stPinchEnd_getOrientation(component->ends[j])));
+            }
+        }
+        //A caller-added component grows and stays last
+        stPinchComponent *added = stPinchAdjacencyComponents_addComponent(flat);
+        CuAssertIntEquals(testCase, n + 1, stPinchAdjacencyComponents_getNumber(flat));
+        CuAssertPtrEquals(testCase, added, stPinchAdjacencyComponents_get(flat, n));
+        for (int64_t i = 0; i < n; i++) {
+            stPinchComponent *component = stPinchAdjacencyComponents_get(flat, i);
+            for (int64_t j = 0; j < component->length; j++) {
+                stPinchComponent_append(added, component->ends[j]);
+            }
+        }
+        CuAssertIntEquals(testCase, stList_length(signature), added->length);
+        stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+        CuAssertIntEquals(testCase, n, stList_length(adjacencyComponents));
+        int64_t k = 0;
+        for (int64_t i = 0; i < n; i++) {
+            stList *adjacencyComponent = stList_get(adjacencyComponents, i);
+            for (int64_t j = 0; j < stList_length(adjacencyComponent); j++) {
+                stPinchEnd *end = stList_get(adjacencyComponent, j);
+                stIntTuple *expected = stList_get(signature, k++);
+                CuAssertIntEquals(testCase, i, stIntTuple_get(expected, 0));
+                CuAssertTrue(testCase, (int64_t) (intptr_t) stPinchEnd_getBlock(end) == stIntTuple_get(expected, 1));
+                CuAssertIntEquals(testCase, stPinchEnd_getOrientation(end), stIntTuple_get(expected, 2));
+            }
+        }
+        CuAssertIntEquals(testCase, stList_length(signature), k);
+        stList_destruct(signature);
+        stList_destruct(adjacencyComponents);
+        stPinchThreadSet_destruct(threadSet);
+    }
+}
+
 static bool hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end1, stPinchBlock *block2) {
     stPinchBlockIt sIt = stPinchBlock_getSegmentIterator(stPinchEnd_getBlock(end1));
     stPinchSegment *segment;
@@ -1751,6 +1802,7 @@ CuSuite* stPinchGraphsTestSuite(void) {
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getLabelIntervals_randomTests);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_attachEnds_reuse);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getThreadComponents_cached);
+    SUITE_ADD_TEST(suite, testStPinchThreadSet_getFlatAdjacencyComponents);
     SUITE_ADD_TEST(suite, testStPinchEnd_hasSelfLoopWithRespectToOtherBlock_randomTests);
     SUITE_ADD_TEST(suite, testStPinchEnd_getSubSequenceLengthsConnectingEnds_randomTests);
     SUITE_ADD_TEST(suite, testStPinchBlock_getNumSupportingHomologies);
