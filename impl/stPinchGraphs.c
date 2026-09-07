@@ -48,6 +48,10 @@ struct _stPinchThreadSet {
 //index costs memory in proportion to segments rather than to thread length, so a long
 //barely-pinched thread pays almost nothing.
 #define ST_PINCH_INDEX_SEGMENTS_PER_BUCKET 4
+//How far a lookup walks from the previous lookup's segment before giving up on it and
+//using the index instead; a few times the bucket size, so a walk is never much worse than
+//the index path it replaces.
+#define ST_PINCH_LOOKUP_CURSOR_STEPS 16
 
 struct _stPinchThread {
     int64_t name;
@@ -61,6 +65,7 @@ struct _stPinchThread {
     int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
     bool indexStale; //set when a merge frees a segment the index may still point at
     stPinchSegment *terminatorSegment; //the sentinel after the last segment; never merged away, so its pSegment is always the last segment
+    stPinchSegment *lastLookup; //the segment the last coordinate lookup returned, or NULL; cleared with the index when a merge frees segments
     void *userData; //owned by the caller, NULL until set (caf stores the thread's event here)
     int64_t threadIndex; //position in the thread set, so callers can keep per-thread arrays
 };
@@ -550,6 +555,40 @@ stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordina
     if (thread->indexStale) {
         memset(thread->index, 0, sizeof(stPinchSegment *) * thread->indexLength);
         thread->indexStale = 0;
+        thread->lastLookup = NULL; //may have been freed by the merge that staled the index
+    }
+    //Lookups come in runs along a thread (the pinches of one alignment are consecutive on both
+    //of its threads), so the segment found last time is usually within a few segments of the
+    //target; a short walk from it in either direction is then cheaper than going through the
+    //index, which starts at a bucket boundary and has to be scanned back to a filled entry.
+    //Splits never free a segment and merges stale the index (clearing the cursor above), so the
+    //cursor is always live here.
+    stPinchSegment *cursor = thread->lastLookup;
+    if (cursor != NULL) {
+        int64_t steps = 0;
+        if (cursor->start <= coordinate) {
+            //the terminator starts past every coordinate accepted above, so it is never stepped onto
+            while (cursor->nSegment->start <= coordinate) {
+                cursor = cursor->nSegment;
+                if (++steps > ST_PINCH_LOOKUP_CURSOR_STEPS) {
+                    cursor = NULL;
+                    break;
+                }
+            }
+        } else {
+            do {
+                cursor = cursor->pSegment;
+                if (cursor == NULL || ++steps > ST_PINCH_LOOKUP_CURSOR_STEPS) {
+                    cursor = NULL;
+                    break;
+                }
+            } while (cursor->start > coordinate);
+        }
+        if (cursor != NULL) {
+            assert(cursor->start <= coordinate && cursor->nSegment->start > coordinate);
+            thread->lastLookup = cursor;
+            return cursor;
+        }
     }
     int64_t target = offset >> thread->indexShift;
     assert(target < thread->indexLength);
@@ -578,6 +617,7 @@ stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordina
         segment = segment->nSegment;
     }
     assert(segment->start <= coordinate);
+    thread->lastLookup = segment;
     return segment;
 }
 
@@ -821,6 +861,7 @@ static stPinchThread *stPinchThread_construct(int64_t name, int64_t start, int64
     terminatorSegment->pSegment = segment;
     thread->firstSegment = segment;
     thread->terminatorSegment = terminatorSegment;
+    thread->lastLookup = NULL;
     thread->userData = NULL;
     return thread;
 }
@@ -1014,16 +1055,28 @@ int64_t stPinchBlock_joinTrivialBoundaries(stPinchBlock *block) {
 }
 
 int64_t stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet) {
+    /*
+     * One sweep over the segments does both kinds of join: a block-less segment absorbs the
+     * block-less run after it, and a block is joined across its trivial boundaries when its
+     * first segment is reached, which is the order the block iterator would visit the blocks
+     * in. The two kinds never touch the same segments (a block join merges block segments with
+     * the neighbouring block's segments, an absorb only block-less ones) so interleaving them
+     * per thread gives the same graph as the former pass over the threads followed by a pass
+     * over the blocks, without walking every segment twice.
+     */
     int64_t changes = 0;
     stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
     stPinchThread *thread;
     while ((thread = stPinchThreadSetIt_getNext(&threadIt)) != NULL) {
-        changes += stPinchThread_joinTrivialBoundaries(thread);
-    }
-    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
-    stPinchBlock *block;
-    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt))) {
-        changes += stPinchBlock_joinTrivialBoundaries(block);
+        stPinchSegment *segment = stPinchThread_getFirst(thread);
+        do {
+            stPinchBlock *block = stPinchSegment_block(segment);
+            if (block == NULL) {
+                changes += stPinchSegment_absorbFollowingBlocklessSegments(segment);
+            } else if (stPinchBlock_getFirst(block) == segment) {
+                changes += stPinchBlock_joinTrivialBoundaries(block);
+            }
+        } while ((segment = stPinchSegment_get3Prime(segment)) != NULL);
     }
     return changes;
 }
@@ -1358,6 +1411,30 @@ static int stPinchSegment_compareP(const void *a, const void *b) {
     return stPinchSegment_compare(*(stPinchSegment * const *) a, *(stPinchSegment * const *) b);
 }
 
+/*
+ * The arrays sorted here hold the segments of one or two blocks, or the lengths between two block ends,
+ * so they are almost always a handful of elements; qsort's overhead dominated the sort at that size.
+ * The orders are total (segments are distinct in thread and coordinate) so any sort gives the same
+ * result as the qsort it replaces.
+ */
+#define SMALL_SORT_SIZE 32
+
+static void sortSegments(stPinchSegment **segments, int64_t n) {
+    if (n > SMALL_SORT_SIZE) {
+        qsort(segments, n, sizeof(stPinchSegment *), stPinchSegment_compareP);
+        return;
+    }
+    for (int64_t i = 1; i < n; i++) {
+        stPinchSegment *segment = segments[i];
+        int64_t j = i;
+        while (j > 0 && stPinchSegment_compare(segments[j - 1], segment) > 0) {
+            segments[j] = segments[j - 1];
+            j--;
+        }
+        segments[j] = segment;
+    }
+}
+
 static stPinchSegment **getSortedBlockSegments(stPinchBlock *block1, stPinchBlock *block2, stPinchSegment **buffer, int64_t *n) {
     *n = stPinchBlock_getDegree(block1) + (block2 != block1 ? stPinchBlock_getDegree(block2) : 0);
     stPinchSegment **segments = *n <= SEGMENT_BUFFER_SIZE ? buffer : st_malloc(*n * sizeof(stPinchSegment *));
@@ -1375,7 +1452,7 @@ static stPinchSegment **getSortedBlockSegments(stPinchBlock *block1, stPinchBloc
     }
     assert(i == *n);
     //The comparison is a total order (no two distinct segments share a thread and start), so any sort gives the same order
-    qsort(segments, *n, sizeof(stPinchSegment *), stPinchSegment_compareP);
+    sortSegments(segments, *n);
     return segments;
 }
 
@@ -1481,6 +1558,22 @@ static int compareInt64(const void *a, const void *b) {
     return i < j ? -1 : (i > j ? 1 : 0);
 }
 
+static void sortInt64s(int64_t *values, int64_t n) {
+    if (n > SMALL_SORT_SIZE) {
+        qsort(values, n, sizeof(int64_t), compareInt64);
+        return;
+    }
+    for (int64_t i = 1; i < n; i++) {
+        int64_t value = values[i];
+        int64_t j = i;
+        while (j > 0 && values[j - 1] > value) {
+            values[j] = values[j - 1];
+            j--;
+        }
+        values[j] = value;
+    }
+}
+
 int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd) {
     LengthBuffer b;
     b.lengths = b.buffer;
@@ -1489,7 +1582,7 @@ int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stP
     stPinchEnd_forEachSubSequenceLengthConnectingEnds(end, otherEnd, appendLengthToBuffer, &b);
     int64_t median = -1;
     if (b.n > 0) {
-        qsort(b.lengths, b.n, sizeof(int64_t), compareInt64); //ascending, like stIntTuple_cmpFn on the list version
+        sortInt64s(b.lengths, b.n); //ascending, like stIntTuple_cmpFn on the list version
         median = b.lengths[b.n / 2];
     }
     if (b.lengths != b.buffer) {
