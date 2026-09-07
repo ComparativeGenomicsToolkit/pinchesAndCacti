@@ -31,6 +31,8 @@ struct _stPinchThreadSet {
     int64_t *threadComponentParent; //union-find over thread indices, filled by the adjacency component search
     int64_t threadComponentParentLength;
     bool threadComponentsValid; //the parent array describes the current graph; cleared when a block changes
+    uint16_t adjacencyEpoch; //stamped on the block ends the adjacency component search reaches, so that
+                             //it needs no pass to clear the marks of the previous search
 };
 
 /*
@@ -117,9 +119,11 @@ typedef struct _stPinchBlockEnds {
 } stPinchBlockEnds;
 
 struct _stPinchBlock {
-    uint64_t degree;
+    uint32_t degree;
+    uint16_t visited[2]; //the adjacency component search (epoch on the thread set) that last reached each end
     uint64_t numSupportingHomologies : 62;
     uint64_t flags : 2; // From least significant bit to highest: modified flag, filter flag
+    int64_t length; //of every segment in the block; kept here so that chain scans need not read the segments
     stPinchSegment *headSegment;
     stPinchSegment *tailSegment;
     stPinchBlockEnds *ends; //NULL unless stPinchThreadSet_attachEnds is live and the block existed when it was called
@@ -171,6 +175,7 @@ stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation)
     stPinchThreadSet_noteBlockOrderChange(segment);
     block->headSegment = segment;
     block->tailSegment = segment;
+    block->length = stPinchSegment_getLength(segment);
     connectBlockToSegment(segment, orientation, block, NULL); // this will set the modified flag
     block->degree = 1;
     return block;
@@ -186,6 +191,7 @@ stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1
     stPinchThreadSet_noteBlockOrderChange(segment1);
     block->headSegment = segment1;
     block->tailSegment = segment2;
+    block->length = stPinchSegment_getLength(segment1);
     connectBlockToSegment(segment1, orientation1, block, segment2);  // this will set the modified flag
     connectBlockToSegment(segment2, orientation2, block, NULL);
     block->degree = 2;
@@ -245,6 +251,7 @@ stPinchBlock *stPinchBlock_pinch2(stPinchBlock *block, stPinchSegment *segment, 
     assert(block->tailSegment != NULL);
     assert(block->tailSegment->nBlockSegment == NULL);
     stPinchThreadSet_noteThreadComponentChange(segment);
+    assert(stPinchSegment_getLength(segment) == block->length);
     block->tailSegment->nBlockSegment = segment;
     connectBlockToSegment(segment, orientation, block, NULL); // sets the modified flag
     block->tailSegment = segment;
@@ -277,7 +284,8 @@ stPinchSegment *stPinchBlock_getFirst(stPinchBlock *block) {
 }
 
 int64_t stPinchBlock_getLength(stPinchBlock *block) {
-    return stPinchSegment_getLength(stPinchBlock_getFirst(block));
+    assert(block->length == stPinchSegment_getLength(stPinchBlock_getFirst(block)));
+    return block->length;
 }
 
 uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block) {
@@ -537,6 +545,8 @@ void stPinchSegment_split(stPinchSegment *segment, int64_t leftSideOfSplitPoint)
             }
             block2->numSupportingHomologies = block->numSupportingHomologies;
         }
+        block->length = stPinchSegment_getLength(block->headSegment);
+        block2->length = stPinchSegment_getLength(block2->headSegment);
     } else {
         stPinchSegment_splitP(segment, leftSegmentLength);
     }
@@ -929,6 +939,7 @@ stPinchThreadSet *stPinchThreadSet_construct() {
     threadSet->threadComponentParent = NULL;
     threadSet->threadComponentParentLength = 0;
     threadSet->threadComponentsValid = 0;
+    threadSet->adjacencyEpoch = 0;
     return threadSet;
 }
 
@@ -1239,8 +1250,10 @@ static int64_t *stPinchThreadSet_resetThreadComponentParent(stPinchThreadSet *th
  * The search reads every segment of every block anyway, so it also joins the threads of each block
  * in the union-find, which spares stPinchThreadSet_getThreadComponents a second pass over them.
  */
-static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack, int64_t *threadComponentParent) {
+static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
     assert(stList_length(stack) == 0);
+    assert(end->block->visited[end->orientation] != epoch);
+    end->block->visited[end->orientation] = epoch;
     stList_append(adjacencyComponent, end);
     stPinchEnd_setComponent(end, adjacencyComponent);
     stList_append(stack, end);
@@ -1266,9 +1279,13 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
                 }
                 stPinchBlock *block = stPinchSegment_getBlock(segment);
                 if (block != NULL) {
-                    stPinchEnd *end2 = stPinchBlock_getEnd(block, stPinchEnd_endOrientation(_5PrimeTraversal, segment));
-                    assert(end2 != NULL);
-                    if (stPinchEnd_getComponent(end2) == NULL) {
+                    //The visit mark is read from the block, which is in hand, rather than from the end
+                    //record, which is another line to fetch; the record is only touched when the end is new
+                    bool orientation2 = stPinchEnd_endOrientation(_5PrimeTraversal, segment);
+                    if (block->visited[orientation2] != epoch) {
+                        block->visited[orientation2] = epoch;
+                        stPinchEnd *end2 = stPinchBlock_getEnd(block, orientation2);
+                        assert(end2 != NULL && stPinchEnd_getComponent(end2) == NULL);
                         stList_append(adjacencyComponent, end2);
                         stPinchEnd_setComponent(end2, adjacencyComponent);
                         stList_append(stack, end2);
@@ -1280,15 +1297,15 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
     }
 }
 
-static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent) {
-    stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
-    assert(end != NULL);
-    if (stPinchEnd_getComponent(end) == NULL) {
+static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
+    if (block->visited[orientation] != epoch) {
+        stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
+        assert(end != NULL && stPinchEnd_getComponent(end) == NULL);
         //the ends belong to the thread set's records; most components are one adjacency between two ends, so
         //room for a few spares the growth of an empty list on the first appends
         stList *adjacencyComponent = stList_constructWithCapacity(4, NULL);
         stList_append(adjacencyComponents, adjacencyComponent);
-        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack, threadComponentParent);
+        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack, threadComponentParent, epoch);
     }
 }
 
@@ -1327,11 +1344,22 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
     stList *stack = stList_construct();
     int64_t *threadComponentParent = stPinchThreadSet_resetThreadComponentParent(threadSet);
+    //A new epoch makes every block end unvisited without a pass over the blocks; when the counter
+    //wraps the marks are reset once, through the records
     stPinchThreadSetAttachedBlockIt blockIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
     stPinchBlock *block;
+    if (++threadSet->adjacencyEpoch == 0) {
+        while ((block = stPinchThreadSetAttachedBlockIt_getNext(&blockIt)) != NULL) {
+            block->visited[0] = 0;
+            block->visited[1] = 0;
+        }
+        threadSet->adjacencyEpoch = 1;
+        blockIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
+    }
+    uint16_t epoch = threadSet->adjacencyEpoch;
     while ((block = stPinchThreadSetAttachedBlockIt_getNext(&blockIt)) != NULL) {
-        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack, threadComponentParent);
-        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack, threadComponentParent);
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack, threadComponentParent, epoch);
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack, threadComponentParent, epoch);
     }
     stList_destruct(stack);
     threadSet->threadComponentsValid = 1;
@@ -1725,6 +1753,7 @@ void stPinchEnd_joinTrivialBoundary(stPinchEnd end) {
     bool _5PrimeTraversal = stPinchEnd_traverse5Prime(end.orientation, segment);
     segment = _5PrimeTraversal ? stPinchSegment_get5Prime(segment) : stPinchSegment_get3Prime(segment);
     assert(segment != NULL && stPinchSegment_getBlock(segment) != NULL && stPinchSegment_getBlock(segment) != end.block);
+    end.block->length += stPinchBlock_getLength(stPinchSegment_getBlock(segment)); //every segment absorbs its neighbour in that block
     stPinchBlock_destruct(stPinchSegment_getBlock(segment)); //get rid of the old block
     stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(end.block);
     while ((segment = stPinchBlockIt_getNext(&segmentIt)) != NULL) {
@@ -2209,9 +2238,11 @@ static stPinchBlock *splitBlockUsingUndoBlock(stPinchBlock *block, stPinchSegmen
 
             int64_t endi = i + undoBlock->degree;
             stPinchBlock *newBlock = st_calloc(1, sizeof(stPinchBlock));
+            stPinchThreadSet_noteBlockOrderChange(segment);
             stPinchBlock_setModifiedFlag(newBlock, 1); // Mark the newly created block as modified
             stPinchBlock_setModifiedFlag(block, 1); // Mark the old block as modified
             newBlock->headSegment = segment;
+            newBlock->length = block->length;
             while (i < endi) {
                 stPinchSegment_setBlockAndOrientation(segment, newBlock, stPinchSegment_orientation(segment));
                 i++;
