@@ -840,6 +840,96 @@ static void testStPinchThreadSet_getAdjacencyComponents_randomTests(CuTest *test
     }
 }
 
+/*
+ * The adjacency components as a flat list of (component index, block, orientation) triples, which
+ * fixes both the order the records enumerate the blocks in and the order of the ends within each
+ * component; two attaches that enumerate the blocks in the same order give equal signatures.
+ */
+static stList *getComponentSignature(stPinchThreadSet *threadSet) {
+    stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+    stList *signature = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+    for (int64_t i = 0; i < stList_length(adjacencyComponents); i++) {
+        stList *adjacencyComponent = stList_get(adjacencyComponents, i);
+        for (int64_t j = 0; j < stList_length(adjacencyComponent); j++) {
+            stPinchEnd *end = stList_get(adjacencyComponent, j);
+            stList_append(signature, stIntTuple_construct3(i, (int64_t) (intptr_t) stPinchEnd_getBlock(end), stPinchEnd_getOrientation(end)));
+        }
+    }
+    stList_destruct(adjacencyComponents);
+    return signature;
+}
+
+static void checkAttachReuseMatchesFreshAttach(CuTest *testCase, stPinchThreadSet *threadSet) {
+    //Attaching an attached set keeps or remakes the records; either way the components must come out as from a fresh attach
+    stPinchThreadSet_attachEnds(threadSet);
+    stList *reused = getComponentSignature(threadSet);
+    stPinchThreadSet_detachEnds(threadSet);
+    stPinchThreadSet_attachEnds(threadSet);
+    stList *fresh = getComponentSignature(threadSet);
+    CuAssertIntEquals(testCase, stList_length(fresh), stList_length(reused));
+    for (int64_t i = 0; i < stList_length(fresh); i++) {
+        CuAssertTrue(testCase, stIntTuple_equalsFn(stList_get(fresh, i), stList_get(reused, i)));
+    }
+    stList_destruct(reused);
+    stList_destruct(fresh);
+}
+
+static void testStPinchThreadSet_attachEnds_reuse(CuTest *testCase) {
+    for (int64_t test = 0; test < 100; test++) {
+        stPinchThreadSet *threadSet = stPinchThreadSet_getRandomGraph();
+        stPinchThreadSet_attachEnds(threadSet);
+        stList *first = getComponentSignature(threadSet);
+        //Nothing changed: the records are kept and the slots emptied
+        stPinchThreadSet_attachEnds(threadSet);
+        CuAssertTrue(testCase, stPinchThreadSet_endsAttached(threadSet));
+        stList *again = getComponentSignature(threadSet);
+        CuAssertIntEquals(testCase, stList_length(first), stList_length(again));
+        for (int64_t i = 0; i < stList_length(first); i++) {
+            CuAssertTrue(testCase, stIntTuple_equalsFn(stList_get(first, i), stList_get(again, i)));
+        }
+        stList_destruct(first);
+        stList_destruct(again);
+        //Destroying blocks leaves the others in order, so the records are kept
+        stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        stPinchBlock *block;
+        int64_t k = 0;
+        stList *toDestroy = stList_construct();
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            if (k++ % 3 == 1) {
+                stList_append(toDestroy, block);
+            }
+        }
+        for (int64_t i = 0; i < stList_length(toDestroy); i++) {
+            stPinchBlock_destruct(stList_get(toDestroy, i));
+        }
+        stList_destruct(toDestroy);
+        checkAttachReuseMatchesFreshAttach(testCase, threadSet);
+        //Pinching makes blocks, so the records are remade
+        if (stPinchThreadSet_getSize(threadSet) >= 2) {
+            stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
+            stPinchThread *thread1 = stPinchThreadSetIt_getNext(&threadIt);
+            stPinchThread *thread2 = stPinchThreadSetIt_getNext(&threadIt);
+            int64_t length = 5;
+            if (stPinchThread_getLength(thread1) > length + 2 && stPinchThread_getLength(thread2) > length + 2) {
+                stPinchThread_pinch(thread1, thread2, stPinchThread_getStart(thread1) + 1, stPinchThread_getStart(thread2) + 1, length, st_random() > 0.5);
+                checkAttachReuseMatchesFreshAttach(testCase, threadSet);
+            }
+        }
+        //Moving a block's first segment changes where the iterator visits it, so the records are remade
+        blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            if (stPinchBlock_getDegree(block) > 1) {
+                stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
+                stPinchBlockIt_getNext(&segmentIt);
+                stPinchSegment_putSegmentFirstInBlock(stPinchBlockIt_getNext(&segmentIt));
+                break;
+            }
+        }
+        checkAttachReuseMatchesFreshAttach(testCase, threadSet);
+        stPinchThreadSet_destruct(threadSet);
+    }
+}
+
 static bool hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end1, stPinchBlock *block2) {
     stPinchBlockIt sIt = stPinchBlock_getSegmentIterator(stPinchEnd_getBlock(end1));
     stPinchSegment *segment;
@@ -1570,6 +1660,7 @@ CuSuite* stPinchGraphsTestSuite(void) {
     SUITE_ADD_TEST(suite, testStPinchInterval);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getLabelIntervals);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getLabelIntervals_randomTests);
+    SUITE_ADD_TEST(suite, testStPinchThreadSet_attachEnds_reuse);
     SUITE_ADD_TEST(suite, testStPinchEnd_hasSelfLoopWithRespectToOtherBlock_randomTests);
     SUITE_ADD_TEST(suite, testStPinchEnd_getSubSequenceLengthsConnectingEnds_randomTests);
     SUITE_ADD_TEST(suite, testStPinchBlock_getNumSupportingHomologies);

@@ -25,6 +25,9 @@ struct _stPinchThreadSet {
     stHash *threadsHash;
     stList *endChunks; //arrays of ST_PINCH_END_CHUNK_SIZE stPinchBlockEnds, NULL when ends are not attached
     int64_t endChunkUsed; //records used in the last chunk
+    int64_t blockEpoch; //bumped whenever a block is made or a block's first segment changes, i.e. whenever
+                        //the order the block iterator visits the blocks in may no longer be the records' order
+    int64_t attachedEpoch; //the blockEpoch the records were made at
 };
 
 /*
@@ -66,6 +69,7 @@ struct _stPinchThread {
     bool indexStale; //set when a merge frees a segment the index may still point at
     stPinchSegment *terminatorSegment; //the sentinel after the last segment; never merged away, so its pSegment is always the last segment
     stPinchSegment *lastLookup; //the segment the last coordinate lookup returned, or NULL; cleared with the index when a merge frees segments
+    stPinchThreadSet *threadSet; //the set the thread was added to
     void *userData; //owned by the caller, NULL until set (caf stores the thread's event here)
     int64_t threadIndex; //position in the thread set, so callers can keep per-thread arrays
 };
@@ -143,8 +147,17 @@ static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stP
     segment->nBlockSegment = nBlockSegment;
 }
 
+/*
+ * A new block, or a block whose first segment changes, can change where the block iterator visits it
+ * relative to the others, so any records attached before then may enumerate the blocks in another order.
+ */
+static inline void stPinchThreadSet_noteBlockOrderChange(stPinchSegment *segment) {
+    segment->thread->threadSet->blockEpoch++;
+}
+
 stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation) {
     stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock)); // note, calloc will set flags and numSupportingHomologies to be 0
+    stPinchThreadSet_noteBlockOrderChange(segment);
     block->headSegment = segment;
     block->tailSegment = segment;
     connectBlockToSegment(segment, orientation, block, NULL); // this will set the modified flag
@@ -159,6 +172,7 @@ stPinchBlock *stPinchBlock_construct2(stPinchSegment *segment) {
 stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1, stPinchSegment *segment2, bool orientation2) {
     assert(stPinchSegment_getLength(segment1) == stPinchSegment_getLength(segment2));
     stPinchBlock *block = st_calloc(1, sizeof(stPinchBlock)); // note, calloc will set flags and numSupportingHomologies to be 0
+    stPinchThreadSet_noteBlockOrderChange(segment1);
     block->headSegment = segment1;
     block->tailSegment = segment2;
     connectBlockToSegment(segment1, orientation1, block, segment2);  // this will set the modified flag
@@ -517,6 +531,7 @@ void stPinchSegment_putSegmentFirstInBlock(stPinchSegment *segment) {
     stPinchBlock *block = stPinchSegment_block(segment);
     if(block != NULL) {
         if(block->headSegment != segment) {
+            stPinchThreadSet_noteBlockOrderChange(segment);
             stPinchSegment *pBlockSegment = block->headSegment;
             while(pBlockSegment->nBlockSegment != segment) {
                 pBlockSegment = pBlockSegment->nBlockSegment;
@@ -894,6 +909,8 @@ stPinchThreadSet *stPinchThreadSet_construct() {
             (int(*)(const void *, const void *)) stPinchThread_equals, NULL, NULL);
     threadSet->endChunks = NULL;
     threadSet->endChunkUsed = 0;
+    threadSet->blockEpoch = 0;
+    threadSet->attachedEpoch = 0;
     return threadSet;
 }
 
@@ -923,7 +940,26 @@ static stPinchBlockEnds *stPinchThreadSet_allocateEnds(stPinchThreadSet *threadS
 }
 
 void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet) {
-    assert(threadSet->endChunks == NULL);
+    if (threadSet->endChunks != NULL) {
+        if (threadSet->attachedEpoch == threadSet->blockEpoch) {
+            //No block has been made and no block's first segment has moved since the records were made, and
+            //destroying a block leaves the others where they were, so the live records still enumerate the
+            //blocks in the block iterator's order: only the slots need to be emptied, which walks the
+            //contiguous records rather than every segment of every thread.
+            for (int64_t i = 0; i < stList_length(threadSet->endChunks); i++) {
+                stPinchBlockEnds *chunk = stList_get(threadSet->endChunks, i);
+                int64_t used = i + 1 == stList_length(threadSet->endChunks) ? threadSet->endChunkUsed : ST_PINCH_END_CHUNK_SIZE;
+                for (int64_t j = 0; j < used; j++) {
+                    chunk[j].component[0] = NULL;
+                    chunk[j].component[1] = NULL;
+                    chunk[j].data[0] = NULL;
+                    chunk[j].data[1] = NULL;
+                }
+            }
+            return;
+        }
+        stPinchThreadSet_detachEnds(threadSet);
+    }
     threadSet->endChunks = stList_construct3(0, free);
     threadSet->endChunkUsed = 0;
     stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
@@ -939,6 +975,7 @@ void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet) {
         }
         block->ends = ends;
     }
+    threadSet->attachedEpoch = threadSet->blockEpoch;
 }
 
 void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet) {
@@ -1010,6 +1047,7 @@ stPinchThread *stPinchThreadSet_addThread(stPinchThreadSet *threadSet, int64_t n
     stPinchThread *thread = stPinchThread_construct(name, start, length);
     assert(stPinchThreadSet_getThread(threadSet, name) == NULL);
     stHash_insert(threadSet->threadsHash, thread, thread);
+    thread->threadSet = threadSet;
     thread->threadIndex = stList_length(threadSet->threads);
     stList_append(threadSet->threads, thread);
     return thread;
@@ -1134,6 +1172,14 @@ stPinchBlock *stPinchThreadSetBlockIt_getNext(stPinchThreadSetBlockIt *blockIt) 
 
 int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet) {
     int64_t blockCount = 0;
+    if (threadSet->endChunks != NULL && threadSet->attachedEpoch == threadSet->blockEpoch) {
+        //every live block has a record, so the records can be counted instead of walking every segment
+        stPinchThreadSetAttachedBlockIt blockIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
+        while (stPinchThreadSetAttachedBlockIt_getNext(&blockIt) != NULL) {
+            blockCount++;
+        }
+        return blockCount;
+    }
     stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
     while (stPinchThreadSetBlockIt_getNext(&blockIt) != NULL) {
         blockCount++;
@@ -1182,7 +1228,9 @@ static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents
     stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
     assert(end != NULL);
     if (stPinchEnd_getComponent(end) == NULL) {
-        stList *adjacencyComponent = stList_construct(); //the ends belong to the thread set's records
+        //the ends belong to the thread set's records; most components are one adjacency between two ends, so
+        //room for a few spares the growth of an empty list on the first appends
+        stList *adjacencyComponent = stList_constructWithCapacity(4, NULL);
         stList_append(adjacencyComponents, adjacencyComponent);
         stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack);
     }
@@ -1193,21 +1241,16 @@ static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents
  * stPinchThreadSet_getBlockIt visited the blocks at the attach. Walking the contiguous records is much
  * cheaper than the block iterator, which walks every segment of every thread.
  */
-typedef struct _stPinchBlockEndsIt {
-    stPinchThreadSet *threadSet;
-    int64_t chunk, i;
-} stPinchBlockEndsIt;
-
-static stPinchBlockEndsIt stPinchThreadSet_getBlockEndsIt(stPinchThreadSet *threadSet) {
+stPinchThreadSetAttachedBlockIt stPinchThreadSet_getAttachedBlockIt(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
-    stPinchBlockEndsIt it;
+    stPinchThreadSetAttachedBlockIt it;
     it.threadSet = threadSet;
     it.chunk = 0;
     it.i = 0;
     return it;
 }
 
-static stPinchBlock *stPinchBlockEndsIt_getNext(stPinchBlockEndsIt *it) {
+stPinchBlock *stPinchThreadSetAttachedBlockIt_getNext(stPinchThreadSetAttachedBlockIt *it) {
     stList *chunks = it->threadSet->endChunks;
     while (it->chunk < stList_length(chunks)) {
         int64_t used = it->chunk + 1 == stList_length(chunks) ? it->threadSet->endChunkUsed : ST_PINCH_END_CHUNK_SIZE;
@@ -1227,9 +1270,9 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
     stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
     stList *stack = stList_construct();
-    stPinchBlockEndsIt blockIt = stPinchThreadSet_getBlockEndsIt(threadSet);
+    stPinchThreadSetAttachedBlockIt blockIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
     stPinchBlock *block;
-    while ((block = stPinchBlockEndsIt_getNext(&blockIt)) != NULL) {
+    while ((block = stPinchThreadSetAttachedBlockIt_getNext(&blockIt)) != NULL) {
         stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack);
         stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack);
     }
@@ -1256,10 +1299,10 @@ stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
     //Now join components progressively according to blocks; the blocks come from the end records when they are
     //attached (the caller in caf always has them attached here), which spares a walk over every segment
     stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
-    stPinchBlockEndsIt blockEndsIt = { threadSet, 0, 0 };
+    stPinchThreadSetAttachedBlockIt blockEndsIt = { threadSet, 0, 0 };
     bool attached = threadSet->endChunks != NULL;
     stPinchBlock *block;
-    while ((block = attached ? stPinchBlockEndsIt_getNext(&blockEndsIt) : stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+    while ((block = attached ? stPinchThreadSetAttachedBlockIt_getNext(&blockEndsIt) : stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
         stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
         stPinchSegment *segment = stPinchBlockIt_getNext(&segmentIt);
         assert(segment != NULL);

@@ -49,6 +49,11 @@ typedef struct _stPinchThreadSetBlockIt {
     stPinchThreadSetSegmentIt segmentIt;
 } stPinchThreadSetBlockIt;
 
+typedef struct _stPinchThreadSetAttachedBlockIt {
+    stPinchThreadSet *threadSet;
+    int64_t chunk, i;
+} stPinchThreadSetAttachedBlockIt;
+
 typedef struct _stPinchBlock stPinchBlock;
 
 typedef struct _stPinchBlockIt {
@@ -166,8 +171,10 @@ int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet);
  * a caller-owned data slot. Lookups by block end then cost two loads rather than a hash probe on a
  * heap-allocated end. Blocks created after the attach have no record (stPinchBlock_getEnd returns
  * NULL for them); a block destroyed while attached leaves its record behind with a NULL block
- * pointer. The records are freed by the detach, which must happen before the pinch graph is next
- * modified by pinching or boundary joining.
+ * pointer. Attaching an already attached set empties the slots and keeps the records if no block has
+ * been made and no block's first segment has been moved since they were made, because the live
+ * records then still enumerate the blocks in the block iterator's order; otherwise the records are
+ * remade with a walk over every segment. Detaching frees the records, as does the set's destruct.
  */
 void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet);
 
@@ -256,6 +263,16 @@ stPinchSegment *stPinchThreadSetSegmentIt_getNext(stPinchThreadSetSegmentIt *seg
 stPinchThreadSetBlockIt stPinchThreadSet_getBlockIt(stPinchThreadSet *threadSet);
 
 stPinchBlock *stPinchThreadSetBlockIt_getNext(stPinchThreadSetBlockIt *blockIt);
+
+/*
+ * Iterates over the blocks that carry an end record, in the order the records were made. Right after
+ * stPinchThreadSet_attachEnds that is the order stPinchThreadSet_getBlockIt visits the blocks in, and
+ * walking the contiguous records is much cheaper than walking every segment of every thread; the order
+ * only stays the same while no block is made, destroyed or reordered.
+ */
+stPinchThreadSetAttachedBlockIt stPinchThreadSet_getAttachedBlockIt(stPinchThreadSet *threadSet);
+
+stPinchBlock *stPinchThreadSetAttachedBlockIt_getNext(stPinchThreadSetAttachedBlockIt *it);
 
 //Thread
 
