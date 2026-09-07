@@ -930,6 +930,95 @@ static void testStPinchThreadSet_attachEnds_reuse(CuTest *testCase) {
     }
 }
 
+/*
+ * The thread components come from a union-find the adjacency component search fills in; they must be the
+ * partition a pass over the blocks gives, before and after the graph changes.
+ */
+static int compareThreadsByName(const void *a, const void *b) {
+    int64_t i = stPinchThread_getName((stPinchThread *) a), j = stPinchThread_getName((stPinchThread *) b);
+    return i > j ? 1 : (i < j ? -1 : 0);
+}
+
+static int compareThreadListsByFirstName(const void *a, const void *b) {
+    return compareThreadsByName(stList_get((stList *) a, 0), stList_get((stList *) b, 0));
+}
+
+static stList *getThreadComponentSignature(stPinchThreadSet *threadSet) {
+    stSortedSet *components = stPinchThreadSet_getThreadComponents(threadSet);
+    stList *signature = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+    stList *componentList = stSortedSet_getList(components);
+    //the set orders components by address, so put them in a canonical order: by lowest thread name
+    for (int64_t i = 0; i < stList_length(componentList); i++) {
+        stList_sort(stList_get(componentList, i), compareThreadsByName);
+    }
+    stList_sort(componentList, compareThreadListsByFirstName);
+    for (int64_t i = 0; i < stList_length(componentList); i++) {
+        stList *component = stList_get(componentList, i);
+        for (int64_t j = 0; j < stList_length(component); j++) {
+            stList_append(signature, stIntTuple_construct2(i, stPinchThread_getName(stList_get(component, j))));
+        }
+    }
+    stList_destruct(componentList);
+    stSortedSet_destruct(components);
+    return signature;
+}
+
+static void checkSignaturesEqual(CuTest *testCase, stList *a, stList *b) {
+    CuAssertIntEquals(testCase, stList_length(a), stList_length(b));
+    for (int64_t i = 0; i < stList_length(a); i++) {
+        CuAssertTrue(testCase, stIntTuple_equalsFn(stList_get(a, i), stList_get(b, i)));
+    }
+}
+
+static void testStPinchThreadSet_getThreadComponents_cached(CuTest *testCase) {
+    for (int64_t test = 0; test < 100; test++) {
+        stPinchThreadSet *threadSet = stPinchThreadSet_getRandomGraph();
+        //Without an adjacency component search: computed from the blocks
+        stList *fresh = getThreadComponentSignature(threadSet);
+        //After the search: read from the union-find it filled in
+        stPinchThreadSet_attachEnds(threadSet);
+        stList *adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+        stList *cached = getThreadComponentSignature(threadSet);
+        checkSignaturesEqual(testCase, fresh, cached);
+        stList_destruct(cached);
+        stList_destruct(fresh);
+        stList_destruct(adjacencyComponents);
+        //Destroying a block may split components; the next call must notice
+        stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        stPinchBlock *block = stPinchThreadSetBlockIt_getNext(&blockIt);
+        if (block != NULL) {
+            stPinchBlock_destruct(block);
+        }
+        cached = getThreadComponentSignature(threadSet);
+        stPinchThreadSet_detachEnds(threadSet);
+        stPinchThreadSet_attachEnds(threadSet);
+        adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+        fresh = getThreadComponentSignature(threadSet);
+        checkSignaturesEqual(testCase, fresh, cached);
+        stList_destruct(cached);
+        stList_destruct(fresh);
+        stList_destruct(adjacencyComponents);
+        //Pinching may merge components
+        if (stPinchThreadSet_getSize(threadSet) >= 2) {
+            stPinchThreadSetIt threadIt = stPinchThreadSet_getIt(threadSet);
+            stPinchThread *thread1 = stPinchThreadSetIt_getNext(&threadIt);
+            stPinchThread *thread2 = stPinchThreadSetIt_getNext(&threadIt);
+            if (stPinchThread_getLength(thread1) > 8 && stPinchThread_getLength(thread2) > 8) {
+                stPinchThread_pinch(thread1, thread2, stPinchThread_getStart(thread1) + 1, stPinchThread_getStart(thread2) + 1, 5, 1);
+                cached = getThreadComponentSignature(threadSet);
+                stPinchThreadSet_attachEnds(threadSet);
+                adjacencyComponents = stPinchThreadSet_getAdjacencyComponents(threadSet);
+                fresh = getThreadComponentSignature(threadSet);
+                checkSignaturesEqual(testCase, fresh, cached);
+                stList_destruct(cached);
+                stList_destruct(fresh);
+                stList_destruct(adjacencyComponents);
+            }
+        }
+        stPinchThreadSet_destruct(threadSet);
+    }
+}
+
 static bool hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end1, stPinchBlock *block2) {
     stPinchBlockIt sIt = stPinchBlock_getSegmentIterator(stPinchEnd_getBlock(end1));
     stPinchSegment *segment;
@@ -1661,6 +1750,7 @@ CuSuite* stPinchGraphsTestSuite(void) {
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getLabelIntervals);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getLabelIntervals_randomTests);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_attachEnds_reuse);
+    SUITE_ADD_TEST(suite, testStPinchThreadSet_getThreadComponents_cached);
     SUITE_ADD_TEST(suite, testStPinchEnd_hasSelfLoopWithRespectToOtherBlock_randomTests);
     SUITE_ADD_TEST(suite, testStPinchEnd_getSubSequenceLengthsConnectingEnds_randomTests);
     SUITE_ADD_TEST(suite, testStPinchBlock_getNumSupportingHomologies);

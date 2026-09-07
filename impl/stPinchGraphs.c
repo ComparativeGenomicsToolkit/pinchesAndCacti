@@ -28,6 +28,9 @@ struct _stPinchThreadSet {
     int64_t blockEpoch; //bumped whenever a block is made or a block's first segment changes, i.e. whenever
                         //the order the block iterator visits the blocks in may no longer be the records' order
     int64_t attachedEpoch; //the blockEpoch the records were made at
+    int64_t *threadComponentParent; //union-find over thread indices, filled by the adjacency component search
+    int64_t threadComponentParentLength;
+    bool threadComponentsValid; //the parent array describes the current graph; cleared when a block changes
 };
 
 /*
@@ -153,6 +156,14 @@ static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stP
  */
 static inline void stPinchThreadSet_noteBlockOrderChange(stPinchSegment *segment) {
     segment->thread->threadSet->blockEpoch++;
+    segment->thread->threadSet->threadComponentsValid = 0;
+}
+
+/*
+ * A segment joining or leaving a block can merge or split the components of threads joined by blocks.
+ */
+static inline void stPinchThreadSet_noteThreadComponentChange(stPinchSegment *segment) {
+    segment->thread->threadSet->threadComponentsValid = 0;
 }
 
 stPinchBlock *stPinchBlock_construct3(stPinchSegment *segment, bool orientation) {
@@ -185,6 +196,9 @@ stPinchBlock *stPinchBlock_construct(stPinchSegment *segment1, bool orientation1
 void stPinchBlock_destruct(stPinchBlock *block) {
     stPinchBlockIt blockIt = stPinchBlock_getSegmentIterator(block);
     stPinchSegment *segment = stPinchBlockIt_getNext(&blockIt);
+    if (segment != NULL) {
+        stPinchThreadSet_noteThreadComponentChange(segment);
+    }
     while (segment != NULL) {
         stPinchSegment *nSegment = stPinchBlockIt_getNext(&blockIt);
         connectBlockToSegment(segment, 0, NULL, NULL);
@@ -230,6 +244,7 @@ stPinchBlock *stPinchBlock_pinch(stPinchBlock *block1, stPinchBlock *block2, boo
 stPinchBlock *stPinchBlock_pinch2(stPinchBlock *block, stPinchSegment *segment, bool orientation) {
     assert(block->tailSegment != NULL);
     assert(block->tailSegment->nBlockSegment == NULL);
+    stPinchThreadSet_noteThreadComponentChange(segment);
     block->tailSegment->nBlockSegment = segment;
     connectBlockToSegment(segment, orientation, block, NULL); // sets the modified flag
     block->tailSegment = segment;
@@ -911,6 +926,9 @@ stPinchThreadSet *stPinchThreadSet_construct() {
     threadSet->endChunkUsed = 0;
     threadSet->blockEpoch = 0;
     threadSet->attachedEpoch = 0;
+    threadSet->threadComponentParent = NULL;
+    threadSet->threadComponentParentLength = 0;
+    threadSet->threadComponentsValid = 0;
     return threadSet;
 }
 
@@ -921,6 +939,7 @@ void stPinchThreadSet_destruct(stPinchThreadSet *threadSet) {
     }
     stList_destruct(threadSet->threads);
     stHash_destruct(threadSet->threadsHash);
+    free(threadSet->threadComponentParent);
     free(threadSet);
 }
 
@@ -1050,6 +1069,7 @@ stPinchThread *stPinchThreadSet_addThread(stPinchThreadSet *threadSet, int64_t n
     thread->threadSet = threadSet;
     thread->threadIndex = stList_length(threadSet->threads);
     stList_append(threadSet->threads, thread);
+    threadSet->threadComponentsValid = 0;
     return thread;
 }
 
@@ -1187,12 +1207,39 @@ int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet) {
     return blockCount;
 }
 
+static int64_t threadComponentFind(int64_t *parent, int64_t i) {
+    while (parent[i] != i) {
+        parent[i] = parent[parent[i]]; //path halving
+        i = parent[i];
+    }
+    return i;
+}
+
+/*
+ * Start a union-find over the thread indices with every thread on its own.
+ */
+static int64_t *stPinchThreadSet_resetThreadComponentParent(stPinchThreadSet *threadSet) {
+    int64_t threadNumber = stPinchThreadSet_getSize(threadSet);
+    if (threadSet->threadComponentParent == NULL || threadSet->threadComponentParentLength != threadNumber) {
+        free(threadSet->threadComponentParent);
+        threadSet->threadComponentParent = st_malloc((threadNumber > 0 ? threadNumber : 1) * sizeof(int64_t));
+        threadSet->threadComponentParentLength = threadNumber;
+    }
+    for (int64_t i = 0; i < threadNumber; i++) {
+        threadSet->threadComponentParent[i] = i;
+    }
+    threadSet->threadComponentsValid = 0;
+    return threadSet->threadComponentParent;
+}
+
 /*
  * Depth first search from one canonical end, marking every end reached through an adjacency with
  * the component. Ends are appended in discovery order, which is what the cactus graph construction
  * in caf keys its own ordering (and hence the names in its output) on, so this order must not change.
+ * The search reads every segment of every block anyway, so it also joins the threads of each block
+ * in the union-find, which spares stPinchThreadSet_getThreadComponents a second pass over them.
  */
-static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack) {
+static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent, stPinchEnd *end, stList *stack, int64_t *threadComponentParent) {
     assert(stList_length(stack) == 0);
     stList_append(adjacencyComponent, end);
     stPinchEnd_setComponent(end, adjacencyComponent);
@@ -1201,7 +1248,16 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
         end = stList_pop(stack);
         stPinchBlockIt blockIt = stPinchBlock_getSegmentIterator(end->block);
         stPinchSegment *segment;
+        int64_t root = -1; //each block is reached from both its ends; its threads are joined at the first
         while ((segment = stPinchBlockIt_getNext(&blockIt)) != NULL) {
+            if (!end->orientation) {
+                int64_t root2 = threadComponentFind(threadComponentParent, segment->thread->threadIndex);
+                if (root == -1) {
+                    root = root2;
+                } else if (root2 != root) {
+                    threadComponentParent[root2] = root;
+                }
+            }
             bool _5PrimeTraversal = stPinchEnd_traverse5Prime(end->orientation, segment);
             while (1) {
                 segment = _5PrimeTraversal ? stPinchSegment_get5Prime(segment) : stPinchSegment_get3Prime(segment);
@@ -1224,7 +1280,7 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stList *adjacencyComponent
     }
 }
 
-static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack) {
+static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent) {
     stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
     assert(end != NULL);
     if (stPinchEnd_getComponent(end) == NULL) {
@@ -1232,7 +1288,7 @@ static void stPinchThreadSet_getAdjacencyComponentsP(stList *adjacencyComponents
         //room for a few spares the growth of an empty list on the first appends
         stList *adjacencyComponent = stList_constructWithCapacity(4, NULL);
         stList_append(adjacencyComponents, adjacencyComponent);
-        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack);
+        stPinchThreadSet_getAdjacencyComponentsP2(adjacencyComponent, end, stack, threadComponentParent);
     }
 }
 
@@ -1270,49 +1326,45 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet) {
     assert(threadSet->endChunks != NULL);
     stList *adjacencyComponents = stList_construct3(0, (void(*)(void *)) stList_destruct);
     stList *stack = stList_construct();
+    int64_t *threadComponentParent = stPinchThreadSet_resetThreadComponentParent(threadSet);
     stPinchThreadSetAttachedBlockIt blockIt = stPinchThreadSet_getAttachedBlockIt(threadSet);
     stPinchBlock *block;
     while ((block = stPinchThreadSetAttachedBlockIt_getNext(&blockIt)) != NULL) {
-        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack);
-        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack);
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 0, stack, threadComponentParent);
+        stPinchThreadSet_getAdjacencyComponentsP(adjacencyComponents, block, 1, stack, threadComponentParent);
     }
     stList_destruct(stack);
+    threadSet->threadComponentsValid = 1;
     return adjacencyComponents;
 }
 
-static int64_t threadComponentFind(int64_t *parent, int64_t i) {
-    while (parent[i] != i) {
-        parent[i] = parent[parent[i]]; //path halving
-        i = parent[i];
-    }
-    return i;
-}
-
 stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
-    //Union-find over thread indices in a flat array: one entry per thread, no hashing per segment
+    //Union-find over thread indices in a flat array: one entry per thread, no hashing per segment. The
+    //adjacency component search fills it in as it reads the blocks, so when the graph has not changed
+    //since then (the caller in caf asks right after it) the pass over the blocks is skipped.
     int64_t threadNumber = stPinchThreadSet_getSize(threadSet);
-    int64_t *parent = st_malloc((threadNumber > 0 ? threadNumber : 1) * sizeof(int64_t));
-    for (int64_t i = 0; i < threadNumber; i++) {
-        parent[i] = i;
-    }
-
-    //Now join components progressively according to blocks; the blocks come from the end records when they are
-    //attached (the caller in caf always has them attached here), which spares a walk over every segment
-    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
-    stPinchThreadSetAttachedBlockIt blockEndsIt = { threadSet, 0, 0 };
-    bool attached = threadSet->endChunks != NULL;
-    stPinchBlock *block;
-    while ((block = attached ? stPinchThreadSetAttachedBlockIt_getNext(&blockEndsIt) : stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
-        stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
-        stPinchSegment *segment = stPinchBlockIt_getNext(&segmentIt);
-        assert(segment != NULL);
-        int64_t root = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
-        while ((segment = stPinchBlockIt_getNext(&segmentIt)) != NULL) {
-            int64_t root2 = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
-            if (root2 != root) {
-                parent[root2] = root;
+    int64_t *parent = threadSet->threadComponentParent;
+    if (!threadSet->threadComponentsValid) {
+        parent = stPinchThreadSet_resetThreadComponentParent(threadSet);
+        //Join components progressively according to blocks; the blocks come from the end records when they are
+        //attached and current, which spares a walk over every segment
+        stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+        stPinchThreadSetAttachedBlockIt blockEndsIt = { threadSet, 0, 0 };
+        bool attached = threadSet->endChunks != NULL && threadSet->attachedEpoch == threadSet->blockEpoch;
+        stPinchBlock *block;
+        while ((block = attached ? stPinchThreadSetAttachedBlockIt_getNext(&blockEndsIt) : stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+            stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
+            stPinchSegment *segment = stPinchBlockIt_getNext(&segmentIt);
+            assert(segment != NULL);
+            int64_t root = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
+            while ((segment = stPinchBlockIt_getNext(&segmentIt)) != NULL) {
+                int64_t root2 = threadComponentFind(parent, stPinchSegment_getThread(segment)->threadIndex);
+                if (root2 != root) {
+                    parent[root2] = root;
+                }
             }
         }
+        threadSet->threadComponentsValid = 1;
     }
 
     //Get a list of the components, each holding its threads in thread set order
@@ -1327,9 +1379,8 @@ stSortedSet *stPinchThreadSet_getThreadComponents(stPinchThreadSet *threadSet) {
         stList_append(componentLists[root], stList_get(threadSet->threads, i));
     }
 
-    //Cleanup
+    //Cleanup; the parent array stays with the thread set for the next call
     free(componentLists);
-    free(parent);
     return threadComponentsSet;
 }
 
