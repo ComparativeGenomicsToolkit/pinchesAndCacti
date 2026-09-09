@@ -229,7 +229,9 @@ stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet);
  * The adjacency components as one shared array of ends and an arena of component headers, which is
  * what a cactus graph build wants: no list per component to make, grow and free. The thread set owns
  * the structure; it is freed by the next call, by a detach or remake of the end records, or by the
- * set's destruct. Each end's component slot holds its stPinchComponent. The components come in
+ * set's destruct. Each end's component slot holds its stPinchComponent, from the moment the search
+ * reaches it: before that the slot may still hold a component of an earlier search, which is why
+ * nothing should read a component slot until the search that fills it has returned. The components come in
  * discovery order and each component's ends in discovery order, exactly as the list form above.
  */
 typedef struct _stPinchComponent stPinchComponent;

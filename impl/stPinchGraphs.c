@@ -1375,7 +1375,7 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stPinchAdjacencyComponents
                     if (block->visited[orientation2] != epoch) {
                         block->visited[orientation2] = epoch;
                         stPinchEnd *end2 = stPinchBlock_getEnd(block, orientation2);
-                        assert(end2 != NULL && stPinchEnd_getComponent(end2) == NULL);
+                        assert(end2 != NULL);
                         stPinchAdjacencyComponents_appendEnd(components, adjacencyComponent, end2);
                         stPinchEnd_setComponent(end2, adjacencyComponent);
                         stList_append(stack, end2);
@@ -1389,8 +1389,11 @@ static void stPinchThreadSet_getAdjacencyComponentsP2(stPinchAdjacencyComponents
 
 static void stPinchThreadSet_getAdjacencyComponentsP(stPinchAdjacencyComponents *components, stPinchBlock *block, bool orientation, stList *stack, int64_t *threadComponentParent, uint16_t epoch) {
     if (block->visited[orientation] != epoch) {
+        //An end's component slot may still hold the component of an earlier search: the search
+        //overwrites it for every end it reaches, and reaches all of them, so only the visit
+        //epoch says whether this end has been seen in this one
         stPinchEnd *end = stPinchBlock_getEnd(block, orientation);
-        assert(end != NULL && stPinchEnd_getComponent(end) == NULL);
+        assert(end != NULL);
         stPinchComponent *adjacencyComponent = stPinchAdjacencyComponents_newComponent(components);
         adjacencyComponent->ends = components->ends + components->numEnds; //a view into the shared array
         adjacencyComponent->capacity = -1;
