@@ -405,6 +405,15 @@ uint64_t stPinchBlock_getDegree(stPinchBlock *block);
 uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block);
 
 /*
+ * Overwrite the supporting homology count.  Pinching maintains this itself, so setting it
+ * is only useful once pinching is done: it then serves as a free 62 bit scratch field for
+ * associating a value with each block, which is cheaper than a block -> value hash table
+ * when there are a lot of blocks.  The value must fit in 62 bits and the original support
+ * count is lost.
+ */
+void stPinchBlock_setNumSupportingHomologies(stPinchBlock *block, uint64_t numSupportingHomologies);
+
+/*
  * Flag to indicate if a block has been modified. Will be set true when a block
  * has segments added or removed.
  */

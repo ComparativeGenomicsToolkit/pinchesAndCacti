@@ -10,6 +10,7 @@
 #include "3_Absorb3edge2x.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 struct _stCactusNode {
     stCactusEdgeEnd *head;
@@ -220,6 +221,14 @@ stCactusNode *stCactusGraph_getNode(stCactusGraph *node, void *nodeObject) {
 }
 
 void stCactusGraph_collapseToCactus(stCactusGraph *graph, void *(*mergeNodeObjects)(void *, void *), stCactusNode *startNode) {
+    //computeThreeEdgeConnectedComponents indexes vertices with int, so bail out here rather
+    //than truncate the node count into an int and work on a graph that is not the input
+    int64_t nodeNumber = stCactusGraph_getNodeNumber(graph);
+    if (nodeNumber >= INT32_MAX) {
+        st_errAbort("Cactus graph has %" PRIi64 " nodes, exceeding the %" PRIi64 " node limit of the "
+                    "3-edge-connected component algorithm", nodeNumber, (int64_t)INT32_MAX - 1);
+    }
+
     //Basic data structures
     stHash *nodesToPositions = stHash_construct();
     stHash *positionsToNodes = stHash_construct3((uint64_t(*)(const void *)) stIntTuple_hashKey,

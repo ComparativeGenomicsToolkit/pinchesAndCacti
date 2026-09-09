@@ -9,6 +9,7 @@
 //
 
 #include <stdlib.h>
+#include <string.h>
 #include "sonLib.h"
 #include "stPinchGraphs.h"
 
@@ -17,22 +18,67 @@ struct _stPinchThreadSet {
     stHash *threadsHash;
 };
 
+/*
+ * Segments of a thread are kept in a doubly-linked list ordered by start coordinate.
+ * Random access by coordinate used to go through a per-thread AVL tree holding every
+ * segment, which cost ~48 bytes of heap per segment (a 32 byte avl_node plus malloc
+ * overhead) and dominated memory in segment-rich graphs.  It is replaced here by a
+ * coarse index: one segment pointer per ST_PINCH_INDEX_BUCKET bases of thread, which
+ * costs a fixed 8 bytes per bucket regardless of how many segments there are.
+ *
+ * Index invariant: if index[k] is not NULL then index[k]->start <= the first
+ * coordinate of bucket k.  So a lookup can always start at index[k] (or at the
+ * nearest non-NULL entry at or before k) and walk 3' to reach the target.  Entries
+ * are filled in and tightened as lookups walk over them, so the walks stay short
+ * without any index maintenance being needed on a split.
+ */
+//Buckets are sized so that each spans roughly this many segments.  Sizing them by how
+//finely the thread is actually broken up, rather than by a fixed number of bases, is what
+//keeps lookups cheap on a highly shattered graph: a fixed bucket that holds a handful of
+//segments in a pangenome holds hundreds of them at high divergence.  It also means the
+//index costs memory in proportion to segments rather than to thread length, so a long
+//barely-pinched thread pays almost nothing.
+#define ST_PINCH_INDEX_SEGMENTS_PER_BUCKET 4
+
 struct _stPinchThread {
     int64_t name;
     int64_t start;
     int64_t length;
-    stSortedSet *segments;
+    stPinchSegment *firstSegment;
+    stPinchSegment **index;
+    int64_t indexLength;
+    int64_t segmentCount;
+    int64_t indexResizeAt; //resize once the thread has this many segments
+    int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
+    bool indexStale; //set when a merge frees a segment the index may still point at
 };
 
+/*
+ * The block pointer and the block orientation share a word: blocks come from malloc so
+ * they are at least 16 byte aligned, leaving the low bit free for the orientation.  This
+ * keeps the segment at 48 bytes rather than 56, which matters because there is one segment
+ * per alignment breakpoint per thread and they dominate memory in a large pinch graph.
+ */
 struct _stPinchSegment {
     stPinchThread *thread;
     int64_t start;
     stPinchSegment *pSegment;
     stPinchSegment *nSegment;
-    stPinchBlock *block;
-    bool blockOrientation;
+    uintptr_t blockAndOrientation;
     stPinchSegment *nBlockSegment;
 };
+
+//48 bytes is the next size class down from 64 in jemalloc, so letting the segment grow
+//past it costs 16 bytes each.  fail the build rather than quietly hand that back
+typedef char stPinchSegment_isSmall[(sizeof(struct _stPinchSegment) <= 48) ? 1 : -1];
+
+#define stPinchSegment_block(segment) ((stPinchBlock *)((segment)->blockAndOrientation & ~(uintptr_t)1))
+#define stPinchSegment_orientation(segment) ((bool)((segment)->blockAndOrientation & (uintptr_t)1))
+
+static inline void stPinchSegment_setBlockAndOrientation(stPinchSegment *segment, stPinchBlock *block, bool orientation) {
+    assert(((uintptr_t)block & (uintptr_t)1) == 0);
+    segment->blockAndOrientation = (uintptr_t)block | (orientation ? (uintptr_t)1 : (uintptr_t)0);
+}
 
 struct _stPinchBlock {
     uint64_t degree;
@@ -48,8 +94,7 @@ static void connectBlockToSegment(stPinchSegment *segment, bool orientation, stP
     if(block != NULL) { // This makes sure  the modified flag is set when the block is altered
         stPinchBlock_setModifiedFlag(block, true);
     }
-    segment->block = block;
-    segment->blockOrientation = orientation;
+    stPinchSegment_setBlockAndOrientation(segment, block, orientation);
     segment->nBlockSegment = nBlockSegment;
 }
 
@@ -163,6 +208,11 @@ uint64_t stPinchBlock_getNumSupportingHomologies(stPinchBlock *block) {
     return block->numSupportingHomologies;
 }
 
+void stPinchBlock_setNumSupportingHomologies(stPinchBlock *block, uint64_t numSupportingHomologies) {
+    assert(numSupportingHomologies < (UINT64_C(1) << 62));
+    block->numSupportingHomologies = numSupportingHomologies;
+}
+
 /*
  * Sets a bit of a chosen flag
  */
@@ -232,15 +282,15 @@ int64_t stPinchSegment_getLength(stPinchSegment *segment) {
 }
 
 stPinchBlock *stPinchSegment_getBlock(stPinchSegment *segment) {
-    return segment->block;
+    return stPinchSegment_block(segment);
 }
 
 bool stPinchSegment_getBlockOrientation(stPinchSegment *segment) {
-    return segment->blockOrientation;
+    return stPinchSegment_orientation(segment);
 }
 
 void stPinchSegment_setBlockOrientation(stPinchSegment *segment, bool orientation) {
-    segment->blockOrientation = orientation;
+    stPinchSegment_setBlockAndOrientation(segment, stPinchSegment_block(segment), orientation);
 }
 
 stPinchSegment *stPinchSegment_get5Prime(stPinchSegment *segment) {
@@ -266,6 +316,61 @@ void stPinchSegment_destruct(stPinchSegment *segment) {
         stPinchBlock_destruct(stPinchSegment_getBlock(segment));
     }
     free(segment);
+}
+
+/*
+ * Rebuild the index at a bucket size suited to how many segments the thread now has.
+ * Called whenever the segment count doubles, so the work is geometric and amortizes to
+ * O(1) per split.  Entries are left empty; lookups fill them back in as they walk.
+ */
+static void stPinchThread_indexResize(stPinchThread *thread) {
+    int64_t targetBuckets = thread->segmentCount / ST_PINCH_INDEX_SEGMENTS_PER_BUCKET + 1;
+    int32_t shift = 0;
+    while (shift < 62 && (thread->length >> shift) > targetBuckets) {
+        shift++;
+    }
+    free(thread->index);
+    thread->indexShift = shift;
+    thread->indexLength = (thread->length >> shift) + 1;
+    thread->index = st_calloc(thread->indexLength, sizeof(stPinchSegment *));
+    thread->indexStale = 0;
+    thread->indexResizeAt = thread->segmentCount * 2;
+}
+
+/*
+ * Point the one index bucket that starts at or after the new segment at it, if that
+ * is tighter than what is already there.  Only a single bucket is touched, so a split
+ * stays O(1); the rest of the index is brought up to date lazily by later lookups.
+ */
+static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *segment) {
+    if (thread->indexStale) {
+        //A merge has freed segments this index still points at, and only a lookup clears
+        //them out, so reading a bucket here would dereference freed memory.  The index is
+        //a hint, so skipping the tighten costs nothing: the next lookup rebuilds it.
+        //Splits reach threads that have had no lookup since the merge, because
+        //stPinchSegment_split splits every segment in the block and a block spans threads.
+        return;
+    }
+    int64_t offset = segment->start - thread->start;
+    //round the offset up to a bucket boundary without risking overflow on huge threads
+    int64_t bucket = (offset >> thread->indexShift) + ((offset & ((INT64_C(1) << thread->indexShift) - 1)) != 0);
+    if (bucket < thread->indexLength) {
+        stPinchSegment *cur = thread->index[bucket];
+        if (cur == NULL || cur->start < segment->start) {
+            thread->index[bucket] = segment;
+        }
+    }
+}
+
+/*
+ * Called when a merge is about to free a segment.  The index may point at it from
+ * buckets we cannot cheaply enumerate, so the whole index is dropped and rebuilt by
+ * subsequent lookups.  Merging is done in bulk passes (stPinchThreadSet_joinTrivialBoundaries),
+ * so in practice this costs one memset per thread rather than one per merge.
+ */
+static void stPinchThread_indexInvalidate(stPinchThread *thread) {
+    thread->segmentCount--;
+    thread->indexStale = 1;
 }
 
 int stPinchSegment_compareBySequencePosition(const stPinchSegment *segment1, const stPinchSegment *segment2) {
@@ -294,7 +399,13 @@ static stPinchSegment *stPinchSegment_splitP(stPinchSegment *segment, int64_t le
     rightSegment->pSegment = segment;
     rightSegment->nSegment = nSegment;
     nSegment->pSegment = rightSegment;
-    stSortedSet_insert(segment->thread->segments, rightSegment);
+    stPinchThread *thread = segment->thread;
+    thread->segmentCount++;
+    if (thread->segmentCount >= thread->indexResizeAt) {
+        stPinchThread_indexResize(thread);
+    } else {
+        stPinchThread_indexTighten(thread, rightSegment);
+    }
     return rightSegment;
 }
 
@@ -330,7 +441,7 @@ void stPinchSegment_split(stPinchSegment *segment, int64_t leftSideOfSplitPoint)
                 block->tailSegment = segment2;
             }
             block2 = stPinchBlock_construct2(segment);
-            segment->blockOrientation = 0; //This gets sets positive by default.
+            stPinchSegment_setBlockOrientation(segment, 0); //This gets sets positive by default.
             pSegment = segment2;
         }
         while ((segment = stPinchBlockIt_getNext(&blockIt)) != NULL) {
@@ -356,20 +467,21 @@ void stPinchSegment_split(stPinchSegment *segment, int64_t leftSideOfSplitPoint)
 }
 
 void stPinchSegment_putSegmentFirstInBlock(stPinchSegment *segment) {
-    if(segment->block != NULL) {
-        if(segment->block->headSegment != segment) {
-            stPinchSegment *pBlockSegment = segment->block->headSegment;
+    stPinchBlock *block = stPinchSegment_block(segment);
+    if(block != NULL) {
+        if(block->headSegment != segment) {
+            stPinchSegment *pBlockSegment = block->headSegment;
             while(pBlockSegment->nBlockSegment != segment) {
                 pBlockSegment = pBlockSegment->nBlockSegment;
                 assert(pBlockSegment != NULL);
             }
             pBlockSegment->nBlockSegment = segment->nBlockSegment;
             if(segment->nBlockSegment == NULL) {
-                assert(segment->block->tailSegment == segment);
-                segment->block->tailSegment = pBlockSegment;
+                assert(block->tailSegment == segment);
+                block->tailSegment = pBlockSegment;
             }
-            segment->nBlockSegment = segment->block->headSegment;
-            segment->block->headSegment = segment;
+            segment->nBlockSegment = block->headSegment;
+            block->headSegment = segment;
         }
     }
 }
@@ -389,25 +501,50 @@ int64_t stPinchThread_getLength(stPinchThread *thread) {
 }
 
 stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordinate) {
-    stPinchSegment segment;
-    segment.start = coordinate;
-    stPinchSegment *segment2 = stSortedSet_searchLessThanOrEqual(thread->segments, &segment);
-    if (segment2 == NULL) {
+    int64_t offset = coordinate - thread->start;
+    if (offset < 0 || offset >= thread->length) {
         return NULL;
     }
-    assert(stPinchSegment_getStart(segment2) <= coordinate);
-    if (stPinchSegment_getStart(segment2) + stPinchSegment_getLength(segment2) <= coordinate) {
-        return NULL;
+    if (thread->indexStale) {
+        memset(thread->index, 0, sizeof(stPinchSegment *) * thread->indexLength);
+        thread->indexStale = 0;
     }
-    return segment2;
+    int64_t target = offset >> thread->indexShift;
+    assert(target < thread->indexLength);
+    //back up to the nearest bucket we have an entry for; every bucket we walk over
+    //below gets filled in, so this scan is short except on the very first lookups
+    int64_t bucket = target;
+    while (bucket > 0 && thread->index[bucket] == NULL) {
+        bucket--;
+    }
+    stPinchSegment *segment = thread->index[bucket];
+    if (segment == NULL) {
+        segment = thread->firstSegment;
+    }
+    assert(segment->start <= thread->start + (bucket << thread->indexShift));
+    while (1) {
+        //the terminator segment starts at thread->start + thread->length, so it always
+        //compares greater than a coordinate we accepted above and is never stepped onto
+        int64_t end = segment->nSegment->start;
+        while (bucket <= target && thread->start + (bucket << thread->indexShift) < end) {
+            thread->index[bucket] = segment;
+            bucket++;
+        }
+        if (end > coordinate) {
+            break;
+        }
+        segment = segment->nSegment;
+    }
+    assert(segment->start <= coordinate);
+    return segment;
 }
 
 stPinchSegment *stPinchThread_getFirst(stPinchThread *thread) {
-    return stSortedSet_getFirst(thread->segments);
+    return thread->firstSegment;
 }
 
 stPinchSegment *stPinchThread_getLast(stPinchThread *thread) {
-    return stSortedSet_getLast(thread->segments);
+    return stPinchThread_getSegment(thread, thread->start + thread->length - 1);
 }
 
 void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint) {
@@ -431,7 +568,7 @@ void stPinchThread_joinTrivialBoundaries(stPinchThread *thread) {
                         segment->nSegment = nSegment->nSegment;
                         assert(nSegment->nSegment != NULL);
                         nSegment->nSegment->pSegment = segment;
-                        stSortedSet_remove(thread->segments, nSegment);
+                        stPinchThread_indexInvalidate(thread);
                         stPinchSegment_destruct(nSegment);
                         continue;
                     }
@@ -590,20 +727,25 @@ static stPinchThread *stPinchThread_construct(int64_t name, int64_t start, int64
     thread->name = name;
     thread->start = start;
     thread->length = length;
-    thread->segments = stSortedSet_construct3((int(*)(const void *, const void *)) stPinchSegment_compareBySequencePosition,
-            (void(*)(void *)) stPinchSegment_destruct);
+    thread->index = NULL;
+    thread->segmentCount = 1;
+    stPinchThread_indexResize(thread);
     stPinchSegment *segment = stPinchSegment_construct(start, thread);
     stPinchSegment *terminatorSegment = stPinchSegment_construct(start + length, thread);
     segment->nSegment = terminatorSegment;
     terminatorSegment->pSegment = segment;
-    stSortedSet_insert(thread->segments, segment);
+    thread->firstSegment = segment;
     return thread;
 }
 
 static void stPinchThread_destruct(stPinchThread *thread) {
-    stPinchSegment *segment = stPinchThread_getLast(thread);
-    free(segment->nSegment);
-    stSortedSet_destruct(thread->segments);
+    stPinchSegment *segment = thread->firstSegment;
+    while (segment != NULL) {
+        stPinchSegment *nSegment = segment->nSegment;
+        stPinchSegment_destruct(segment); //also tears down the segment's block, if any
+        segment = nSegment;
+    }
+    free(thread->index);
     free(thread);
 }
 
@@ -1041,8 +1183,8 @@ stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchE
 static void merge3Prime(stPinchSegment *segment) {
     stPinchSegment *nSegment = segment->nSegment;
     assert(nSegment != NULL && nSegment != segment);
-    stSortedSet_remove(segment->thread->segments, nSegment);
-    assert(nSegment->block == NULL);
+    stPinchThread_indexInvalidate(segment->thread);
+    assert(stPinchSegment_block(nSegment) == NULL);
     assert(nSegment->nSegment != NULL);
     segment->nSegment = nSegment->nSegment;
     nSegment->nSegment->pSegment = segment;
@@ -1052,11 +1194,13 @@ static void merge3Prime(stPinchSegment *segment) {
 static void merge5Prime(stPinchSegment *segment) {
     stPinchSegment *pSegment = segment->pSegment;
     assert(pSegment != NULL && pSegment != segment);
-    stSortedSet_remove(segment->thread->segments, pSegment);
-    assert(pSegment->block == NULL);
+    stPinchThread_indexInvalidate(segment->thread);
+    assert(stPinchSegment_block(pSegment) == NULL);
     segment->pSegment = pSegment->pSegment;
     if (pSegment->pSegment != NULL) {
         pSegment->pSegment->nSegment = segment;
+    } else {
+        segment->thread->firstSegment = segment;
     }
     assert(pSegment->start < segment->start);
     segment->start = pSegment->start;
@@ -1561,7 +1705,7 @@ static stPinchBlock *splitBlockUsingUndoBlock(stPinchBlock *block, stPinchSegmen
             stPinchBlock_setModifiedFlag(block, 1); // Mark the old block as modified
             newBlock->headSegment = segment;
             while (i < endi) {
-                segment->block = newBlock;
+                stPinchSegment_setBlockAndOrientation(segment, newBlock, stPinchSegment_orientation(segment));
                 i++;
                 if (i < endi) {
                     segment = segment->nBlockSegment;
