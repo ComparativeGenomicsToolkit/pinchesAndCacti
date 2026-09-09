@@ -1024,11 +1024,12 @@ stPinchThreadSet *stPinchThreadSet_construct() {
 
 void stPinchThreadSet_destruct(stPinchThreadSet *threadSet) {
     stPinchThreadSet_forgetAdjacencyComponents(threadSet);
+    //The threads go first: tearing them down destructs their blocks, and a block clears the
+    //record it points at as it goes, so the records have to outlive them
+    stList_destruct(threadSet->threads);
     if (threadSet->endChunks != NULL) {
-        //the blocks go with the threads below, so their record pointers need no clearing
         stList_destruct(threadSet->endChunks);
     }
-    stList_destruct(threadSet->threads);
     stHash_destruct(threadSet->threadsHash);
     free(threadSet->threadComponentParent);
     free(threadSet);
