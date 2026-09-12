@@ -49,6 +49,11 @@ typedef struct _stPinchThreadSetBlockIt {
     stPinchThreadSetSegmentIt segmentIt;
 } stPinchThreadSetBlockIt;
 
+typedef struct _stPinchThreadSetAttachedBlockIt {
+    stPinchThreadSet *threadSet;
+    int64_t chunk, i;
+} stPinchThreadSetAttachedBlockIt;
+
 typedef struct _stPinchBlock stPinchBlock;
 
 typedef struct _stPinchBlockIt {
@@ -140,7 +145,20 @@ stPinchThread *stPinchThreadSetIt_getNext(stPinchThreadSetIt *);
  * stPinchThread_joinTrivialBoundaries heals only trivial segment
  * splits.
  */
-void stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
+int64_t stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
+
+/*
+ * The two-end step of stPinchThreadSet_joinTrivialBoundaries for one block: joins whichever of its
+ * boundaries are trivial (the block survives, its neighbour is absorbed). Returns the number joined.
+ */
+int64_t stPinchBlock_joinTrivialBoundaries(stPinchBlock *block);
+
+/*
+ * Given a segment with no block, merges the run of block-less segments it lies in into the run's
+ * first segment, exactly as stPinchThread_joinTrivialBoundaries would, and returns that segment.
+ * The given segment may have been freed on return unless it is the one returned.
+ */
+stPinchSegment *stPinchSegment_joinTrivialBoundaries(stPinchSegment *segment);
 
 /*
  * Get the total number of blocks in the graph.
@@ -148,19 +166,95 @@ void stPinchThreadSet_joinTrivialBoundaries(stPinchThreadSet *threadSet);
 int64_t stPinchThreadSet_getTotalBlockNumber(stPinchThreadSet *threadSet);
 
 /*
+ * Block end records. While attached, every block that existed at the time of the attach carries a
+ * record holding its two canonical stPinchEnd objects and, per end, an adjacency component slot and
+ * a caller-owned data slot. Lookups by block end then cost two loads rather than a hash probe on a
+ * heap-allocated end. Blocks created after the attach have no record (stPinchBlock_getEnd returns
+ * NULL for them); a block destroyed while attached leaves its record behind with a NULL block
+ * pointer. Attaching an already attached set empties the slots and keeps the records if no block has
+ * been made and no block's first segment has been moved since they were made, because the live
+ * records then still enumerate the blocks in the block iterator's order; otherwise the records are
+ * remade with a walk over every segment. Detaching frees the records, as does the set's destruct.
+ */
+void stPinchThreadSet_attachEnds(stPinchThreadSet *threadSet);
+
+void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet);
+
+bool stPinchThreadSet_endsAttached(stPinchThreadSet *threadSet);
+
+/*
+ * Set every record's data slots back to NULL, so a later phase can reuse them.
+ */
+void stPinchThreadSet_clearEndData(stPinchThreadSet *threadSet);
+
+/*
+ * The block's canonical end for the given orientation, or NULL if the block has no record.
+ */
+stPinchEnd *stPinchBlock_getEnd(stPinchBlock *block, bool orientation);
+
+/*
+ * The canonical end equal to the given (possibly static or heap allocated) end, and the canonical
+ * end of the other orientation of the same block. Both require the block to have a record.
+ */
+stPinchEnd *stPinchEnd_getCanonical(const stPinchEnd *end);
+
+stPinchEnd *stPinchEnd_getOtherEnd(const stPinchEnd *end);
+
+/*
+ * The adjacency component slot and the caller data slot of the end's record; the end need not
+ * be the canonical one.
+ */
+void *stPinchEnd_getComponent(const stPinchEnd *end);
+
+void stPinchEnd_setComponent(const stPinchEnd *end, void *component);
+
+void *stPinchEnd_getData(const stPinchEnd *end);
+
+void stPinchEnd_setData(const stPinchEnd *end, void *data);
+
+/*
  * Get a list of adjacency-connected components for this pinch
  * graph. Each connected component is represented by a list of
  * stPinchEnds that are directly or indirectly connected by an
- * adjacency or series of adjacencies.
+ * adjacency or series of adjacencies. Requires the ends to be
+ * attached: the ends in the lists are the canonical ends of the
+ * records, and each end's component slot is set to its list.
+ * Only blocks that existed at the attach take part (later ones have
+ * no record). The returned list owns the component lists but not
+ * the ends.
  */
 stList *stPinchThreadSet_getAdjacencyComponents(stPinchThreadSet *threadSet);
 
 /*
- * Same as stPinchThreadSet_getAdjacencyComponents, except you also
- * get a pointer to a hash that maps block ends to adjacency
- * components.
+ * The adjacency components as one shared array of ends and an arena of component headers, which is
+ * what a cactus graph build wants: no list per component to make, grow and free. The thread set owns
+ * the structure; it is freed by the next call, by a detach or remake of the end records, or by the
+ * set's destruct. Each end's component slot holds its stPinchComponent, from the moment the search
+ * reaches it: before that the slot may still hold a component of an earlier search, which is why
+ * nothing should read a component slot until the search that fills it has returned. The components come in
+ * discovery order and each component's ends in discovery order, exactly as the list form above.
  */
-stList *stPinchThreadSet_getAdjacencyComponents2(stPinchThreadSet *threadSet, stHash **edgeEndsToAdjacencyComponents);
+typedef struct _stPinchComponent stPinchComponent;
+struct _stPinchComponent {
+    stPinchEnd **ends;
+    int32_t length;
+    int32_t capacity; //-1 for a component whose ends are a view into the shared array; otherwise the array is its own and can grow
+    stPinchComponent *next, *tail; //free for the caller to string components together
+};
+typedef struct _stPinchAdjacencyComponents stPinchAdjacencyComponents;
+
+stPinchAdjacencyComponents *stPinchThreadSet_getFlatAdjacencyComponents(stPinchThreadSet *threadSet);
+
+int64_t stPinchAdjacencyComponents_getNumber(stPinchAdjacencyComponents *components);
+
+stPinchComponent *stPinchAdjacencyComponents_get(stPinchAdjacencyComponents *components, int64_t i);
+
+/*
+ * Adds an empty component with its own growable array of ends after the existing ones.
+ */
+stPinchComponent *stPinchAdjacencyComponents_addComponent(stPinchAdjacencyComponents *components);
+
+void stPinchComponent_append(stPinchComponent *component, stPinchEnd *end);
 
 /*
  * Get a list of thread components. Each thread component is a list of
@@ -201,6 +295,16 @@ stPinchThreadSetBlockIt stPinchThreadSet_getBlockIt(stPinchThreadSet *threadSet)
 
 stPinchBlock *stPinchThreadSetBlockIt_getNext(stPinchThreadSetBlockIt *blockIt);
 
+/*
+ * Iterates over the blocks that carry an end record, in the order the records were made. Right after
+ * stPinchThreadSet_attachEnds that is the order stPinchThreadSet_getBlockIt visits the blocks in, and
+ * walking the contiguous records is much cheaper than walking every segment of every thread; the order
+ * only stays the same while no block is made, destroyed or reordered.
+ */
+stPinchThreadSetAttachedBlockIt stPinchThreadSet_getAttachedBlockIt(stPinchThreadSet *threadSet);
+
+stPinchBlock *stPinchThreadSetAttachedBlockIt_getNext(stPinchThreadSetAttachedBlockIt *it);
+
 //Thread
 
 /*
@@ -235,6 +339,18 @@ stPinchSegment *stPinchThread_getFirst(stPinchThread *stPinchThread);
 stPinchSegment *stPinchThread_getLast(stPinchThread *thread);
 
 /*
+ * An arbitrary pointer owned by the caller, NULL until set. Not touched by the pinch graph itself.
+ */
+void *stPinchThread_getUserData(stPinchThread *thread);
+
+void stPinchThread_setUserData(stPinchThread *thread, void *userData);
+
+/*
+ * The thread's position in its thread set (0 for the first thread added), fixed for the thread's life.
+ */
+int64_t stPinchThread_getIndex(stPinchThread *thread);
+
+/*
  * Split the segment at the given thread and position in two, such
  * that there will be two segments, the left (or 5')-most of which
  * includes leftSideOfSplitPoint as its last base. If
@@ -249,7 +365,12 @@ void stPinchThread_split(stPinchThread *thread, int64_t leftSideOfSplitPoint);
  * NB: Unlike stPinchThreadSet_joinTrivialBoundaries, this does not
  * heal trivial breaks between blocks.
  */
-void stPinchThread_joinTrivialBoundaries(stPinchThread *thread);
+int64_t stPinchThread_joinTrivialBoundaries(stPinchThread *thread);
+
+/*
+ * The number of segments the thread currently has, not counting the terminator.
+ */
+int64_t stPinchThread_getSegmentCount(stPinchThread *thread);
 
 /*
  * Pinch two threads together (a pairwise gapless alignment). Handles
@@ -528,10 +649,38 @@ int64_t stPinchEnd_getNumberOfConnectedPinchEnds(stPinchEnd *end);
 bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock(stPinchEnd *end, stPinchBlock *otherBlock);
 
 /*
+ * A one-block cache of what the two predicates below read about a block's segments, sorted. They
+ * are asked about the links of a chain in order, and consecutive links share a block, so the far
+ * block of one call is the near block of the next: with a cache each block's segments are read
+ * from memory once per pass rather than twice. The cache is only valid while no block changes;
+ * make one per pass and destruct it after.
+ */
+typedef struct _stPinchSortedSegmentsCache stPinchSortedSegmentsCache;
+
+stPinchSortedSegmentsCache *stPinchSortedSegmentsCache_construct(void);
+
+void stPinchSortedSegmentsCache_destruct(stPinchSortedSegmentsCache *cache);
+
+/*
+ * How many times a block's segments have been read for these predicates, over the process's life.
+ */
+int64_t stPinchSortedSegmentsCache_getBlockReads(void);
+
+bool stPinchEnd_hasSelfLoopWithRespectToOtherBlock2(stPinchEnd *end, stPinchBlock *otherBlock, stPinchSortedSegmentsCache *cache);
+
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds2(stPinchEnd *end, stPinchEnd *otherEnd, stPinchSortedSegmentsCache *cache);
+
+/*
  * Get a list of stIntTuples representing the lengths of the
  * (indirect) adjacencies connecting the two ends.
  */
 stList *stPinchEnd_getSubSequenceLengthsConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd);
+
+/*
+ * The median (element n/2 of the ascending sort) of the lengths stPinchEnd_getSubSequenceLengthsConnectingEnds
+ * would return, or -1 if there are none, computed without allocating.
+ */
+int64_t stPinchEnd_getMedianSubSequenceLengthConnectingEnds(stPinchEnd *end, stPinchEnd *otherEnd);
 
 /*
  * Pinch structure. A pinch represents a gapless alignment between two
@@ -609,10 +758,11 @@ int stPinchInterval_compareFunction(const stPinchInterval *interval1, const stPi
 void stPinchInterval_destruct(stPinchInterval *pinchInterval);
 
 /*
- * Create a set of pinch intervals such that each interval's label
- * corresponds to the closest pinch end.
+ * Create a set of pinch intervals such that each interval's label is
+ * the adjacency component (as set in the end records by
+ * stPinchThreadSet_getAdjacencyComponents) of the closest pinch end.
  */
-stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet, stHash *pinchEndsToLabels);
+stSortedSet *stPinchThreadSet_getLabelIntervals(stPinchThreadSet *threadSet);
 
 /*
  * Get the interval corresponding to the given thread and position

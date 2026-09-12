@@ -115,10 +115,23 @@ typedef struct __3EdgeVars {
 
     int parent, child;
     //******************************************************************************
-    stList *list, *list2;
+    int *members, *starts, memberCount; /*components are emitted into these arrays, see emitComponent*/
     //
     struct adjacencyEdgeChunk *adjacencyEdgeChunks;
 } _3EdgeVars;
+
+/*Records the component whose representative is u: u first, then the rest of its sigma cycle, in
+ the order the original code appended them to its output list.*/
+static void emitComponent(_3EdgeVars *ev, int u) {
+    ev->starts[ev->compNum] = ev->memberCount;
+    ev->members[ev->memberCount++] = u - 1;
+    int tmp2 = ev->next_sigma_element[u];
+    while (tmp2 != u) {
+        ev->members[ev->memberCount++] = tmp2 - 1;
+        tmp2 = ev->next_sigma_element[tmp2];
+    }
+    ev->compNum++;
+}
 
 struct Frame {
     int w;
@@ -401,21 +414,7 @@ static void three_edge_connectP(int w, int v, struct Frame *frame, stList *stack
                          */
                     }
                 }
-                ev->compNum = ev->compNum + 1;
-                //PRINT
-                ev->list2 = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
-                stList_append(ev->list, ev->list2);
-                stList_append(ev->list2, stIntTuple_construct1(u-1));
-                //st_logDebug("\nNew component found: %d", u);
-                //PRINT
-                ev->tmp2 = ev->next_sigma_element[u];
-                while (ev->tmp2 != u) {
-                    //PRINT
-                    //st_logDebug(",%d", ev->tmp2);
-                    stList_append(ev->list2, stIntTuple_construct1(ev->tmp2-1)); //constructInt(tmp2));
-                    //PRINT
-                    ev->tmp2 = ev->next_sigma_element[ev->tmp2];
-                }
+                emitComponent(ev, u);
             }//end of if (degree==2)
             else
                 ev->Pu = u;
@@ -506,11 +505,10 @@ static void three_edge_connectP(int w, int v, struct Frame *frame, stList *stack
 } //end of three-edge-connect procedure
 //******************************************************************************
 
-stList *computeThreeEdgeConnectedComponents(stList *vertices) {
-    int Vnum = stList_length(vertices) + 1;
+void computeThreeEdgeConnectedComponentsCSR(int n, const int *offsets, const int *adj, int **membersOut, int **startsOut, int *nComponentsOut) {
+    int Vnum = n + 1;
     int edgeNum = 0; /*initilizing the number of ev->edges in G*/
-    int r, n, v, indx;
-    int64_t i;
+    int r, v, indx;
     double tsum;
     clock_t first, end;
     st_logDebug(
@@ -519,7 +517,9 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
 
     //*********************************Memory allocation
     _3EdgeVars *ev = st_calloc(1, sizeof(_3EdgeVars));
-    ev->list = stList_construct3(0, (void(*)(void *)) stList_destruct);
+    ev->members = (int *) st_malloc((n > 0 ? n : 1) * sizeof(int));
+    ev->starts = (int *) st_malloc(Vnum * sizeof(int));
+    ev->memberCount = 0;
 
     ev->LG = (adjacentG**) st_malloc(Vnum * sizeof(struct adjacent_with_u_in_G *));
 
@@ -548,22 +548,17 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
         ev->visited[indx] = 'N';
         ev->outgoing_tree_edge[indx] = '1';
     }
-    indx = 0;
 
-    for (i = 0; i < stList_length(vertices); i++) {
-        stList *edges = stList_get(vertices, i);
-        v = i + 1;
-        stListIterator *it = stList_getIterator(edges);
-        stIntTuple *N;
-        while((N = stList_getNext(it)) != NULL) {
-            n = stIntTuple_get(N, 0)+1;
+    /*Each adjacency list is built by prepending, so it ends up reversed relative to the input
+     order; the depth first search below depends on that order, so this must not change.*/
+    for (v = 1; v < Vnum; v++) {
+        for (indx = offsets[v - 1]; indx < offsets[v]; indx++) {
             ev->edge = adjacencyEdge_construct(ev);
-            ev->edge->u = n;
+            ev->edge->u = adj[indx] + 1;
             ev->edge->more = ev->LG[v];
             ev->LG[v] = ev->edge;
             edgeNum = edgeNum + 1;
         }
-        stList_destructIterator(it);
     }
     edgeNum = edgeNum / 2;
 
@@ -571,45 +566,15 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
             Vnum - 1, edgeNum, Vnum + edgeNum - 1);
 
     ev->count = 1;
-    //   r = 1;
     for (r = 1; r < Vnum; r++) {
         if (ev->visited[r] == 'N') {
-
-            /*//YesOrNo
-             if (r>1) {
-             printf("It's a NO instance!");
-             exit(1);
-             }
-             *///YesOrNo
-
             three_edge_connect(r, 0, ev);
-            ev->compNum++;
-            //PRINT
-            ev->list2 = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
-            stList_append(ev->list, ev->list2);
-            stList_append(ev->list2, stIntTuple_construct1(r-1));
-            //st_logDebug("\nNew component found: %d", r);
-            //PRINT
-            ev->tmp2 = ev->next_sigma_element[r];
-            while (ev->tmp2 != r) {
-                //PRINT
-                //st_logDebug(",%d", ev->tmp2);
-                stList_append(ev->list2, stIntTuple_construct1(ev->tmp2-1));
-                //PRINT
-                ev->tmp2 = ev->next_sigma_element[ev->tmp2];
-            }
+            emitComponent(ev, r);
         }
     }
+    ev->starts[ev->compNum] = ev->memberCount; /*sentinel: the end of the last component*/
 
     st_logDebug("Found components\n");
-
-    /*//YesOrNo
-     printf("It's a YES instance!");
-     end=clock(); //save again CPU clock to variable end
-     tsum = (end-first)/CLOCKS_PER_SEC;//CLK_TCK;  //compute total elapsed time
-     printf("\nElapsed Time: %f",tsum);
-     exit(1);
-     *///YesOrNo
 
     end = clock(); //save again CPU clock to variable end
     tsum = (end - first) / CLOCKS_PER_SEC; //compute total elapsed time
@@ -625,7 +590,9 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
         free(ev->adjacencyEdgeChunks);
         ev->adjacencyEdgeChunks = nextChunk;
     }
-    stList *returnList = ev->list; // The list to return, saving a pointer to it before cleaning up ev
+    *membersOut = ev->members;
+    *startsOut = ev->starts;
+    *nComponentsOut = ev->compNum;
     free(ev->LG);
     free(ev->LB);
     free(ev->LBend);
@@ -637,6 +604,38 @@ stList *computeThreeEdgeConnectedComponents(stList *vertices) {
     free(ev->visited);
     free(ev->outgoing_tree_edge);
     free(ev);
+}
 
-    return returnList;
+stList *computeThreeEdgeConnectedComponents(stList *vertices) {
+    /*The list based interface: convert to the compressed sparse row form and back.*/
+    int n = stList_length(vertices);
+    int *offsets = (int *) st_malloc((n + 1) * sizeof(int));
+    int totalEdges = 0;
+    for (int i = 0; i < n; i++) {
+        offsets[i] = totalEdges;
+        totalEdges += stList_length(stList_get(vertices, i));
+    }
+    offsets[n] = totalEdges;
+    int *adj = (int *) st_malloc((totalEdges > 0 ? totalEdges : 1) * sizeof(int));
+    for (int i = 0; i < n; i++) {
+        stList *edges = stList_get(vertices, i);
+        for (int j = 0; j < stList_length(edges); j++) {
+            adj[offsets[i] + j] = stIntTuple_get(stList_get(edges, j), 0);
+        }
+    }
+    int *members, *starts, nComponents;
+    computeThreeEdgeConnectedComponentsCSR(n, offsets, adj, &members, &starts, &nComponents);
+    stList *components = stList_construct3(0, (void(*)(void *)) stList_destruct);
+    for (int i = 0; i < nComponents; i++) {
+        stList *component = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
+        stList_append(components, component);
+        for (int j = starts[i]; j < starts[i + 1]; j++) {
+            stList_append(component, stIntTuple_construct1(members[j]));
+        }
+    }
+    free(members);
+    free(starts);
+    free(offsets);
+    free(adj);
+    return components;
 }
