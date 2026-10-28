@@ -151,7 +151,7 @@ struct _stPinchThread {
     int32_t indexShift; //bucket k spans [start + (k << indexShift), start + ((k+1) << indexShift))
     bool indexStale; //set when a merge frees a segment the index may still point at
     stPinchSegment *terminatorSegment; //the sentinel after the last segment; never merged away, so its pSegment is always the last segment
-    stPinchSegment *lastLookup; //the segment the last coordinate lookup returned, or NULL; cleared with the index when a merge frees segments
+    stPinchSegment *lastLookup; //the segment the last coordinate lookup returned, or NULL; cleared when a merge frees a segment of the thread
     stPinchThreadSet *threadSet; //the set the thread was added to
     void *userData; //owned by the caller, NULL until set (caf stores the thread's event here)
     int64_t threadIndex; //position in the thread set, so callers can keep per-thread arrays
@@ -506,11 +506,12 @@ static void stPinchThread_indexResize(stPinchThread *thread) {
  */
 static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *segment) {
     if (thread->indexStale) {
-        //A merge has freed segments this index still points at, and only a lookup clears
-        //them out, so reading a bucket here would dereference freed memory.  The index is
-        //a hint, so skipping the tighten costs nothing: the next lookup rebuilds it.
+        //A merge has freed segments this index still points at, and only a lookup or a resize
+        //clears them out, so reading a bucket here would dereference freed memory.  The index
+        //is a hint, so skipping the tighten costs nothing: the next lookup rebuilds it.
         //Splits reach threads that have had no lookup since the merge, because
-        //stPinchSegment_split splits every segment in the block and a block spans threads.
+        //stPinchSegment_split splits every segment in the block and a block spans threads,
+        //and because callers split segments they hold rather than look up (stCaf_ensureEndsAreDistinct).
         return;
     }
     int64_t offset = segment->start - thread->start;
@@ -528,11 +529,15 @@ static void stPinchThread_indexTighten(stPinchThread *thread, stPinchSegment *se
  * Called when a merge is about to free a segment.  The index may point at it from
  * buckets we cannot cheaply enumerate, so the whole index is dropped and rebuilt by
  * subsequent lookups.  Merging is done in bulk passes (stPinchThreadSet_joinTrivialBoundaries),
- * so in practice this costs one memset per thread rather than one per merge.
+ * so in practice this costs one memset per thread rather than one per merge.  The lookup
+ * cursor may be the segment too.  It is dropped here, not at the next lookup, because a split
+ * made without a lookup on this thread (see stPinchThread_indexTighten) can resize the index,
+ * and so clear the stale flag, before then.
  */
 static void stPinchThread_indexInvalidate(stPinchThread *thread) {
     thread->segmentCount--;
     thread->indexStale = 1;
+    thread->lastLookup = NULL;
 }
 
 int stPinchSegment_compareBySequencePosition(const stPinchSegment *segment1, const stPinchSegment *segment2) {
@@ -673,14 +678,13 @@ stPinchSegment *stPinchThread_getSegment(stPinchThread *thread, int64_t coordina
     if (thread->indexStale) {
         memset(thread->index, 0, sizeof(stPinchSegment *) * thread->indexLength);
         thread->indexStale = 0;
-        thread->lastLookup = NULL; //may have been freed by the merge that staled the index
     }
     //Lookups come in runs along a thread (the pinches of one alignment are consecutive on both
     //of its threads), so the segment found last time is usually within a few segments of the
     //target; a short walk from it in either direction is then cheaper than going through the
     //index, which starts at a bucket boundary and has to be scanned back to a filled entry.
-    //Splits never free a segment and merges stale the index (clearing the cursor above), so the
-    //cursor is always live here.
+    //Splits never free a segment and every merge clears the cursor (stPinchThread_indexInvalidate),
+    //so the cursor is always live here.
     stPinchSegment *cursor = thread->lastLookup;
     if (cursor != NULL) {
         int64_t steps = 0;

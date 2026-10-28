@@ -1781,12 +1781,35 @@ static void testStPinchThread_getSegment_longThread(CuTest *testCase) {
     stPinchThreadSet_destruct(threadSet);
 }
 
+static void testStPinchThread_getSegment_afterMergeAndResize(CuTest *testCase) {
+    //a merge can free the segment a thread's last lookup returned, and a split reached through
+    //a block can then resize that thread's index before anything looks it up again
+    stPinchThreadSet *threadSet = stPinchThreadSet_construct();
+    stPinchThread *thread1 = stPinchThreadSet_addThread(threadSet, 1, 0, 1000);
+    stPinchThread *thread2 = stPinchThreadSet_addThread(threadSet, 2, 0, 1000);
+    stPinchThread_pinch(thread1, thread2, 300, 300, 600, 1);
+    stPinchThread_split(thread2, 99);
+    stPinchThread_split(thread2, 199);
+    //leaves thread2's lookup cursor on [100, 200)
+    CuAssertIntEquals(testCase, 100, stPinchSegment_getStart(stPinchThread_getSegment(thread2, 150)));
+    //absorbs [100, 300) into [0, 100), freeing the cursor
+    stPinchThreadSet_joinTrivialBoundaries(threadSet);
+    //enough splits of the block to resize thread2's index, all of them looked up on thread1
+    for (int64_t i = 301; i < 900; i += 3) {
+        stPinchThread_split(thread1, i);
+    }
+    CuAssertPtrEquals(testCase, getSegmentByScan(thread2, 150), stPinchThread_getSegment(thread2, 150));
+    checkThreadIndex(testCase, threadSet);
+    stPinchThreadSet_destruct(threadSet);
+}
+
 CuSuite* stPinchGraphsTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
     SUITE_ADD_TEST(suite, testStPinchThreadSet);
     SUITE_ADD_TEST(suite, testStPinchThreadAndSegment);
     SUITE_ADD_TEST(suite, testStPinchThread_getSegment_randomTests);
     SUITE_ADD_TEST(suite, testStPinchThread_getSegment_longThread);
+    SUITE_ADD_TEST(suite, testStPinchThread_getSegment_afterMergeAndResize);
     SUITE_ADD_TEST(suite, testStPinchBlock_NoSplits);
     SUITE_ADD_TEST(suite, testStPinchBlock_Splits);
     SUITE_ADD_TEST(suite, testStPinchThread_pinch);
