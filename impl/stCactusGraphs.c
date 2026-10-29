@@ -7,7 +7,7 @@
 
 #include "sonLib.h"
 #include "stCactusGraphs.h"
-#include "3_Absorb3edge2x.h"
+#include "stThreeEdgeConnected.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -325,7 +325,7 @@ static void ptrStack_destruct(PtrStack *stack) {
 }
 
 void stCactusGraph_collapseToCactus(stCactusGraph *graph, void *(*mergeNodeObjects)(void *, void *), stCactusNode *startNode) {
-    //computeThreeEdgeConnectedComponents indexes vertices with int, so bail out here rather
+    //stThreeEdgeConnected_getComponents indexes vertices with int, so bail out here rather
     //than truncate the node count into an int and work on a graph that is not the input
     int64_t nodeNumber = stCactusGraph_getNodeNumber(graph);
     if (nodeNumber >= INT32_MAX) {
@@ -363,7 +363,7 @@ void stCactusGraph_collapseToCactus(stCactusGraph *graph, void *(*mergeNodeObjec
     }
     assert(k == edgeEndNumber);
     int *members, *starts, componentNumber;
-    computeThreeEdgeConnectedComponentsCSR(nodeNumber, offsets, adj, &members, &starts, &componentNumber);
+    stThreeEdgeConnected_getComponents(nodeNumber, offsets, adj, &members, &starts, &componentNumber);
     //Now do the merging
     for (int64_t i = 0; i < componentNumber; i++) {
         stCactusNode *node = nodes[members[starts[i]]];

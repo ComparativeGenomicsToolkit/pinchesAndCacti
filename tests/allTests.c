@@ -10,6 +10,7 @@
 CuSuite* stCactusGraphsTestSuite(void);
 CuSuite* stPinchGraphsTestSuite(void);
 CuSuite* stPinchPhylogenyTestSuite(void);
+CuSuite* stThreeEdgeConnectedTestSuite(void);
 
 int stPinchesAndCactiRunAllTests(void) {
     CuString *output = CuStringNew();
@@ -17,6 +18,7 @@ int stPinchesAndCactiRunAllTests(void) {
     CuSuiteAddSuite(suite, stPinchGraphsTestSuite());
     CuSuiteAddSuite(suite, stCactusGraphsTestSuite());
     CuSuiteAddSuite(suite, stPinchPhylogenyTestSuite());
+    CuSuiteAddSuite(suite, stThreeEdgeConnectedTestSuite());
 
     CuSuiteRun(suite);
     CuSuiteSummary(suite, output);
