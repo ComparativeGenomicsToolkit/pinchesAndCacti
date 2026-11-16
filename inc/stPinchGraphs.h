@@ -183,6 +183,17 @@ void stPinchThreadSet_detachEnds(stPinchThreadSet *threadSet);
 bool stPinchThreadSet_endsAttached(stPinchThreadSet *threadSet);
 
 /*
+ * Lists every block's segments by thread name and then start, and turns the block round if need be so that the first
+ * of them is in the block's orientation. Which segment a block lists first, and which way round it is, otherwise come
+ * from the order its segments were pinched in, and everything that walks the blocks follows them: the order the block
+ * iterator and the end records visit blocks in, the adjacency components, and a cactus graph made from them. After
+ * this they depend only on what the blocks are, and not on the order the alignments that made them came in. The
+ * alignment itself is unchanged. If any block changed, attached end records are detached (a block turned round has its
+ * ends the other way); attach again to use them. Returns the number of blocks changed.
+ */
+int64_t stPinchThreadSet_sortBlockSegments(stPinchThreadSet *threadSet);
+
+/*
  * Set every record's data slots back to NULL, so a later phase can reuse them.
  */
 void stPinchThreadSet_clearEndData(stPinchThreadSet *threadSet);
