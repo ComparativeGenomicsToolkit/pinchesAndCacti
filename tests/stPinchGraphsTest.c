@@ -1803,6 +1803,168 @@ static void testStPinchThread_getSegment_afterMergeAndResize(CuTest *testCase) {
     stPinchThreadSet_destruct(threadSet);
 }
 
+/*
+ * The graph as a list of (thread, start, length, key thread, key start, orientation) per segment, in thread and then
+ * sequence order, where the key is the lowest (thread, start) of the segment's block (-1 without one) and the
+ * orientation is relative to that segment: what the graph is, leaving out how its blocks list their segments.
+ */
+static stList *getGraphContent(stPinchThreadSet *threadSet, int64_t threadNumber) {
+    stList *content = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
+    for (int64_t t = 0; t < threadNumber; t++) {
+        for (stPinchSegment *segment = stPinchThread_getFirst(stPinchThreadSet_getThread(threadSet, t)); segment != NULL;
+             segment = stPinchSegment_get3Prime(segment)) {
+            int64_t keyThread = -1, keyStart = -1, orientation = 0;
+            stPinchBlock *block = stPinchSegment_getBlock(segment);
+            if (block != NULL) {
+                stPinchSegment *keySegment = NULL;
+                stPinchBlockIt blockIt = stPinchBlock_getSegmentIterator(block);
+                stPinchSegment *segment2;
+                while ((segment2 = stPinchBlockIt_getNext(&blockIt)) != NULL) {
+                    int64_t name = stPinchThread_getName(stPinchSegment_getThread(segment2));
+                    if (keySegment == NULL || name < keyThread || (name == keyThread && stPinchSegment_getStart(segment2) < keyStart)) {
+                        keySegment = segment2;
+                        keyThread = name;
+                        keyStart = stPinchSegment_getStart(segment2);
+                    }
+                }
+                orientation = stPinchSegment_getBlockOrientation(segment) == stPinchSegment_getBlockOrientation(keySegment);
+            }
+            int64_t values[6] = { t, stPinchSegment_getStart(segment), stPinchSegment_getLength(segment), keyThread, keyStart, orientation };
+            stList_append(content, stIntTuple_constructN(6, values));
+        }
+    }
+    return content;
+}
+
+/*
+ * How the graph is laid out, as everything that walks it sees it: the blocks in the block iterator's order, each with
+ * its segments in the order the block lists them and their orientations, then the adjacency components in the order
+ * the search makes them, each with its ends in order.
+ */
+static stList *getGraphLayout(stPinchThreadSet *threadSet) {
+    stList *layout = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
+    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlock *block;
+    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+        stList_append(layout, stIntTuple_construct1(-1));
+        stPinchBlockIt segmentIt = stPinchBlock_getSegmentIterator(block);
+        stPinchSegment *segment;
+        while ((segment = stPinchBlockIt_getNext(&segmentIt)) != NULL) {
+            stList_append(layout, stIntTuple_construct3(stPinchThread_getName(stPinchSegment_getThread(segment)),
+                                                        stPinchSegment_getStart(segment), stPinchSegment_getBlockOrientation(segment)));
+        }
+    }
+    stPinchThreadSet_attachEnds(threadSet);
+    stList *components = stPinchThreadSet_getAdjacencyComponents(threadSet);
+    for (int64_t i = 0; i < stList_length(components); i++) {
+        stList *component = stList_get(components, i);
+        stList_append(layout, stIntTuple_construct1(-2));
+        for (int64_t j = 0; j < stList_length(component); j++) {
+            stPinchEnd *end = stList_get(component, j);
+            stPinchSegment *head = stPinchBlock_getFirst(stPinchEnd_getBlock(end));
+            stList_append(layout, stIntTuple_construct3(stPinchThread_getName(stPinchSegment_getThread(head)),
+                                                        stPinchSegment_getStart(head), stPinchEnd_getOrientation(end)));
+        }
+    }
+    stList_destruct(components);
+    stPinchThreadSet_detachEnds(threadSet);
+    return layout;
+}
+
+static bool sameTuples(stList *list1, stList *list2) {
+    if (stList_length(list1) != stList_length(list2)) {
+        return 0;
+    }
+    for (int64_t i = 0; i < stList_length(list1); i++) {
+        if (stIntTuple_cmpFn(stList_get(list1, i), stList_get(list2, i)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void testStPinchThreadSet_sortBlockSegments_randomTests(CuTest *testCase) {
+    /*
+     * The same alignments pinched in two orders make the same graph, laid out differently.  Once the blocks' segments
+     * are sorted it is laid out the same way too.  Random pinches between short threads often align a base to another
+     * both ways round, and then the graph keeps the way of whichever pinch came first: those graphs differ in what
+     * they are and are skipped.
+     */
+    int64_t compared = 0, laidOutDifferently = 0;
+    for (int64_t test = 0; test < 1000; test++) {
+        int64_t threadNumber = st_randomInt(2, 6), threadLength = st_randomInt(50, 500), pinchNumber = st_randomInt(0, 300);
+        int64_t (*pinches)[6] = st_malloc(sizeof(int64_t[6]) * (pinchNumber > 0 ? pinchNumber : 1));
+        int64_t *order = st_malloc(sizeof(int64_t) * (pinchNumber > 0 ? pinchNumber : 1));
+        for (int64_t i = 0; i < pinchNumber; i++) {
+            int64_t length = st_randomInt(1, 20), thread1 = st_randomInt(0, threadNumber), thread2;
+            do {
+                thread2 = st_randomInt(0, threadNumber);
+            } while (thread2 == thread1);
+            pinches[i][0] = thread1;
+            pinches[i][1] = thread2;
+            pinches[i][2] = st_randomInt(0, threadLength - length + 1);
+            pinches[i][3] = st_randomInt(0, threadLength - length + 1);
+            pinches[i][4] = length;
+            pinches[i][5] = st_random() > 0.5;
+            order[i] = i;
+        }
+        stPinchThreadSet *threadSets[2];
+        for (int64_t k = 0; k < 2; k++) {
+            if (k == 1) { //the second graph gets the pinches in another order
+                for (int64_t i = pinchNumber - 1; i > 0; i--) {
+                    int64_t j = st_randomInt(0, i + 1), swap = order[i];
+                    order[i] = order[j];
+                    order[j] = swap;
+                }
+            }
+            threadSets[k] = stPinchThreadSet_construct();
+            for (int64_t t = 0; t < threadNumber; t++) {
+                stPinchThreadSet_addThread(threadSets[k], t, 0, threadLength);
+            }
+            for (int64_t i = 0; i < pinchNumber; i++) {
+                int64_t *p = pinches[order[i]];
+                stPinchThread_pinch(stPinchThreadSet_getThread(threadSets[k], p[0]), stPinchThreadSet_getThread(threadSets[k], p[1]),
+                                    p[2], p[3], p[4], p[5]);
+            }
+            stPinchThreadSet_joinTrivialBoundaries(threadSets[k]);
+        }
+        stList *content1 = getGraphContent(threadSets[0], threadNumber);
+        stList *content2 = getGraphContent(threadSets[1], threadNumber);
+        if (sameTuples(content1, content2)) {
+            compared++;
+            stList *layout1 = getGraphLayout(threadSets[0]), *layout2 = getGraphLayout(threadSets[1]);
+            laidOutDifferently += !sameTuples(layout1, layout2);
+            stList_destruct(layout1);
+            stList_destruct(layout2);
+
+            stPinchThreadSet_attachEnds(threadSets[0]);
+            int64_t changed = stPinchThreadSet_sortBlockSegments(threadSets[0]);
+            CuAssertTrue(testCase, changed == 0 || !stPinchThreadSet_endsAttached(threadSets[0])); //it drops records it makes stale
+            stPinchThreadSet_sortBlockSegments(threadSets[1]);
+            CuAssertIntEquals(testCase, 0, stPinchThreadSet_sortBlockSegments(threadSets[0])); //sorting again changes nothing
+
+            stList *sorted1 = getGraphContent(threadSets[0], threadNumber); //the alignment is unchanged
+            CuAssertTrue(testCase, sameTuples(content1, sorted1));
+            stList_destruct(sorted1);
+            layout1 = getGraphLayout(threadSets[0]);
+            layout2 = getGraphLayout(threadSets[1]);
+            CuAssertTrue(testCase, sameTuples(layout1, layout2));
+            stList_destruct(layout1);
+            stList_destruct(layout2);
+        }
+        stList_destruct(content1);
+        stList_destruct(content2);
+        stPinchThreadSet_destruct(threadSets[0]);
+        stPinchThreadSet_destruct(threadSets[1]);
+        free(pinches);
+        free(order);
+    }
+    st_logInfo("%" PRIi64 " of 1000 random graphs compared, %" PRIi64 " of them laid out differently before sorting\n",
+               compared, laidOutDifferently);
+    CuAssertTrue(testCase, compared >= 50); //or the test tested nothing
+    CuAssertTrue(testCase, laidOutDifferently >= 20);
+}
+
 CuSuite* stPinchGraphsTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
     SUITE_ADD_TEST(suite, testStPinchThreadSet);
@@ -1818,6 +1980,7 @@ CuSuite* stPinchGraphsTestSuite(void) {
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getAdjacencyComponents);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getAdjacencyComponents_randomTests);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_joinTrivialBoundaries_randomTests);
+    SUITE_ADD_TEST(suite, testStPinchThreadSet_sortBlockSegments_randomTests);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_getThreadComponents);
     SUITE_ADD_TEST(suite, testStPinchThreadSet_trimAlignments_randomTests);
     SUITE_ADD_TEST(suite, testStPinchInterval);

@@ -1126,6 +1126,71 @@ void stPinchThreadSet_clearEndData(stPinchThreadSet *threadSet) {
     }
 }
 
+static int compareSegmentsByThreadAndStart(const void *a, const void *b) {
+    const stPinchSegment *segment1 = *(stPinchSegment * const *) a, *segment2 = *(stPinchSegment * const *) b;
+    if (segment1->thread->name != segment2->thread->name) {
+        return segment1->thread->name < segment2->thread->name ? -1 : 1;
+    }
+    //two segments of one block cannot start at the same place on one thread
+    return segment1->start < segment2->start ? -1 : (segment1->start > segment2->start ? 1 : 0);
+}
+
+static bool stPinchBlock_segmentsSorted(stPinchBlock *block) {
+    if (!stPinchSegment_orientation(block->headSegment)) {
+        return 0;
+    }
+    for (stPinchSegment *segment = block->headSegment; segment->nBlockSegment != NULL; segment = segment->nBlockSegment) {
+        if (compareSegmentsByThreadAndStart(&segment, &segment->nBlockSegment) > 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int64_t stPinchThreadSet_sortBlockSegments(stPinchThreadSet *threadSet) {
+    int64_t changed = 0, capacity = 0;
+    stPinchSegment **segments = NULL;
+    //The block iterator walks the threads and gives a block at its first segment.  Sorting a block can move that
+    //further along, and then the block comes round again, already sorted: the check costs a pass over its segments
+    stPinchThreadSetBlockIt blockIt = stPinchThreadSet_getBlockIt(threadSet);
+    stPinchBlock *block;
+    while ((block = stPinchThreadSetBlockIt_getNext(&blockIt)) != NULL) {
+        if (stPinchBlock_segmentsSorted(block)) {
+            continue;
+        }
+        if (block->degree > capacity) {
+            capacity = 2 * (int64_t) block->degree;
+            segments = st_realloc(segments, capacity * sizeof(stPinchSegment *));
+        }
+        int64_t n = 0;
+        for (stPinchSegment *segment = block->headSegment; segment != NULL; segment = segment->nBlockSegment) {
+            segments[n++] = segment;
+        }
+        assert(n == block->degree);
+        qsort(segments, n, sizeof(stPinchSegment *), compareSegmentsByThreadAndStart);
+        //a segment's orientation is relative to its block's, so turning the block round flips every one of them
+        bool turn = !stPinchSegment_orientation(segments[0]);
+        for (int64_t i = 0; i < n; i++) {
+            segments[i]->nBlockSegment = i + 1 < n ? segments[i + 1] : NULL;
+            if (turn) {
+                segments[i]->blockAndOrientation ^= (uintptr_t) 1;
+            }
+        }
+        block->headSegment = segments[0];
+        block->tailSegment = segments[n - 1];
+        changed++;
+    }
+    free(segments);
+    if (changed > 0) {
+        //first segments have moved, and blocks turned round have their ends the other way, so any records are stale
+        threadSet->blockEpoch++;
+        if (threadSet->endChunks != NULL) {
+            stPinchThreadSet_detachEnds(threadSet);
+        }
+    }
+    return changed;
+}
+
 stPinchEnd *stPinchBlock_getEnd(stPinchBlock *block, bool orientation) {
     return block->ends == NULL ? NULL : &block->ends->ends[orientation ? 1 : 0];
 }
